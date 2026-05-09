@@ -8,6 +8,8 @@ use gpzip_codec_gpu::GpuBackend;
 use gpzip_core::archive;
 use gpzip_core::BackendRegistry;
 
+use crate::progress::Progress;
+
 const DEFAULT_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
@@ -28,6 +30,10 @@ struct Cli {
     /// less parallelism. Default 2 MiB.
     #[arg(long, default_value_t = DEFAULT_CHUNK_BYTES, global = true)]
     chunk_size: usize,
+
+    /// Suppress the progress bar.
+    #[arg(short = 'q', long, global = true)]
+    quiet: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -80,21 +86,23 @@ pub fn run() -> Result<()> {
             inputs,
             level,
         } => {
-            archive::pack(
-                &out,
-                &inputs,
-                gpzip_core::Level(level),
-                &registry,
-                gpzip_core::ProgressSink::noop(),
-            )
-            .map_err(|e| anyhow!(e))?;
+            let (sink, prog) = sink_for(cli.quiet, "packing");
+            let res = archive::pack(&out, &inputs, gpzip_core::Level(level), &registry, sink);
+            if let Some(p) = prog {
+                p.finish();
+            }
+            res.map_err(|e| anyhow!(e))?;
         }
         Command::X {
             archive: ar,
             output,
         } => {
-            archive::unpack(&ar, &output, &registry, gpzip_core::ProgressSink::noop())
-                .map_err(|e| anyhow!(e))?;
+            let (sink, prog) = sink_for(cli.quiet, "extracting");
+            let res = archive::unpack(&ar, &output, &registry, sink);
+            if let Some(p) = prog {
+                p.finish();
+            }
+            res.map_err(|e| anyhow!(e))?;
         }
         Command::L { archive: ar } => {
             let entries = archive::list_archive(&ar, &registry).map_err(|e| anyhow!(e))?;
@@ -105,6 +113,15 @@ pub fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn sink_for(quiet: bool, label: &str) -> (gpzip_core::ProgressSink, Option<Progress>) {
+    if quiet {
+        (gpzip_core::ProgressSink::noop(), None)
+    } else {
+        let p = Progress::new(label);
+        (p.sink(), Some(p))
+    }
 }
 
 fn build_registry(choice: BackendChoice, chunk_size: usize, threads: usize) -> BackendRegistry {

@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 mod app;
+mod progress;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()

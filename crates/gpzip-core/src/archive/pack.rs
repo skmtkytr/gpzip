@@ -103,6 +103,44 @@ fn add_path_to_zip<W: Write + std::io::Seek>(
     Ok(())
 }
 
+fn add_path_to_tar<W: Write>(
+    tb: &mut tar::Builder<W>,
+    src: &Path,
+    arc_path: &Path,
+    sink: &ProgressSink,
+) -> Result<()> {
+    let meta = std::fs::symlink_metadata(src)?;
+    if meta.is_dir() {
+        tb.append_dir(arc_path, src)?;
+        let mut entries: Vec<_> = std::fs::read_dir(src)?.collect::<std::io::Result<Vec<_>>>()?;
+        // Stable order helps reproducibility and progress UX.
+        entries.sort_by_key(|e| e.file_name());
+        for ent in entries {
+            let child_arc = arc_path.join(ent.file_name());
+            add_path_to_tar(tb, &ent.path(), &child_arc, sink)?;
+        }
+    } else if meta.is_file() {
+        sink.send(ProgressEvent::FileStarted {
+            path: arc_path.to_string_lossy().into_owned(),
+            size: meta.len(),
+        });
+        let mut f = File::open(src)?;
+        tb.append_file(arc_path, &mut f)?;
+        sink.send(ProgressEvent::FileFinished {
+            path: arc_path.to_string_lossy().into_owned(),
+        });
+    } else if meta.file_type().is_symlink() {
+        // Encode symlinks as such; don't follow them (matches follow_symlinks(false)).
+        let target = std::fs::read_link(src)?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_metadata(&meta);
+        tb.append_link(&mut header, arc_path, &target)?;
+    }
+    Ok(())
+}
+
 fn pack_tar(
     archive: &Path,
     inputs: &[PathBuf],
@@ -127,20 +165,7 @@ fn pack_tar(
         let arc_name = input.file_name().ok_or_else(|| {
             Error::InvalidArchive(format!("input has no file name: {}", input.display()))
         })?;
-        let meta = std::fs::metadata(input)?;
-        if meta.is_dir() {
-            tb.append_dir_all(arc_name, input)?;
-        } else {
-            sink.send(ProgressEvent::FileStarted {
-                path: arc_name.to_string_lossy().into_owned(),
-                size: meta.len(),
-            });
-            let mut f = File::open(input)?;
-            tb.append_file(arc_name, &mut f)?;
-            sink.send(ProgressEvent::FileFinished {
-                path: arc_name.to_string_lossy().into_owned(),
-            });
-        }
+        add_path_to_tar(&mut tb, input, Path::new(arc_name), sink)?;
     }
     let mut writer = tb.into_inner()?;
     writer.flush()?;
