@@ -82,9 +82,13 @@ and distance symbols. Single-stage profile dropped from 11.5 ms to
 Functionally correct (round-trips verified, tests pass) but on the
 benchmark box (Ryzen 7800X3D + RTX 4090) the per-chunk wall time and
 the output ratio both still trail the CPU path. See the table below.
-The remaining levers — Huffman emission on the GPU, sliding-window
-match-finding so larger chunks stay window-eligible — are the next
-research targets.
+
+The dynamic-Huffman emit phase is now also available on the GPU
+(D-3, opt-in via `GPZIP_GPU_ENCODE=1`). Single-call benches showed
+the GPU emit at ~2× host_dyn, but under production load it's
+roughly net-neutral — host encoding parallelises across rayon
+workers while the GPU encoder serialises through one worker. The env
+var is a measurement / fallback knob, not the production default.
 
 ## Hybrid CPU + GPU
 
@@ -107,14 +111,14 @@ Ryzen 7800X3D (8C/16T) + RTX 4090, level 5, 3 trials averaged. Inputs
 harvested from local source trees, man pages, journal logs, and
 `/usr/bin` binaries; sizes shown.
 
-|              | source (23M) | text (47M)  | logs (8M)   | binmix (272M) |
+|              | source (23M) | text (47M)  | logs (9M)   | binmix (272M) |
 |---           |---           |---          |---          |---            |
-| gpzip-cpu    | 22 / .130    | 57 / .269   | 12 / .037   | 223 / .316    |
-| gpzip-hybrid | 286 / .141   | 302 / .275  | 268 / .039  | 470 / .318    |
-| gpzip-gpu    | 346 / .180   | 391 / .337  | 305 / .055  | 1044 / .359   |
-| gzip serial  | 254 / .129   | 1097 / .264 | 25 / .035   | 6686 / .306   |
-| pigz -p 16   | 18 / .127    | 56 / .267   |  -- / --    | 227 / .314    |
-| zstd -T0     | 24 / .111    | 44 / .221   | 9 / .029    | 140 / .278    |
+| gpzip-cpu    | 26 / .130    | 56 / .269   | 12 / .046   | 233 / .316    |
+| gpzip-hybrid | 227 / .133   | 234 / .271  | 212 / .050  | 411 / .317    |
+| gpzip-gpu    | 267 / .162   | 300 / .309  | 246 / .058  | 631 / .346    |
+| gzip serial  | 256 / .129   | 1110 / .264 | 33 / .045   | 6745 / .306   |
+| pigz -p 16   | 20 / .127    | 49 / .267   | 6 / .046    | 235 / .314    |
+| zstd -T0     | 24 / .111    | 45 / .221   | 10 / .037   | 143 / .278    |
 
 (numbers are wall-time ms / output ratio; lower is better in both)
 
