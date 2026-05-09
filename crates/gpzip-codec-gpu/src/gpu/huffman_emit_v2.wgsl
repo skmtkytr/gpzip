@@ -28,6 +28,12 @@
 struct Params {
     n_tokens: u32,
     n_workgroups: u32,
+    // Bit offset where the per-token emissions start in `output[]`. The
+    // host pre-writes the block header (BFINAL/BTYPE for fixed, plus the
+    // dynamic-Huffman header for BTYPE=10) into output[0..ceil(header_bit_count/8)]
+    // before the dispatch. The emit shader places token bits starting at
+    // this offset and the EOB right after them.
+    header_bit_count: u32,
 }
 
 @group(0) @binding(0)  var<storage, read>       tokens:           array<u32>;
@@ -183,25 +189,23 @@ fn emit(@builtin(global_invocation_id) gid: vec3<u32>,
         @builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
     let i = gid.x;
-
-    // Thread (0,0) also writes the 3-bit block header.
-    // BFINAL=1, BTYPE=01 packed LSB-first → 0b011 = 3.
-    if (wid.x == 0u && lid.x == 0u) {
-        write_bits(0u, 3u, 3u);
-    }
+    let hdr = params.header_bit_count;
 
     if (i >= params.n_tokens) {
-        // The last "would-be" thread also emits the EOB. Pick the thread
-        // whose i == n_tokens (the first out-of-range thread). Its
-        // workgroup_bases lookup needs guarding, though.
+        // The first out-of-range thread (i == n_tokens) emits the EOB.
+        // The workgroup containing the LAST token is `n_workgroups - 1`
+        // — not `n_tokens / WG_SIZE`, which is one too high when
+        // n_tokens is a multiple of WG_SIZE and would read OOB on the
+        // workgroup_bases / workgroup_totals arrays. The bug went
+        // unnoticed for fixed Huffman because the fixed EOB code is
+        // all-zero (atomicOr with 0 is idempotent), but dynamic Huffman
+        // has non-zero EOB bits and an OOB read returned 0, placing the
+        // EOB at offset = hdr instead of past the body.
         if (i == params.n_tokens) {
-            let last_wg = (params.n_tokens) / WG_SIZE;
+            let last_wg = params.n_workgroups - 1u;
             let body_offset = workgroup_bases[last_wg];
-            // Last per-token offset within the last workgroup =
-            //   workgroup_totals[last_wg] (= sum of all bits in that wg)
             let bits_in_last_wg = workgroup_totals[last_wg];
-            let global_after_tokens = 3u + body_offset + bits_in_last_wg;
-            // EOB symbol = 256
+            let global_after_tokens = hdr + body_offset + bits_in_last_wg;
             let eob_code = lit_codes_pre[256u];
             let eob_bits = lit_lens[256u];
             write_bits(global_after_tokens, eob_code, eob_bits);
@@ -212,7 +216,7 @@ fn emit(@builtin(global_invocation_id) gid: vec3<u32>,
     let tok = tokens[i];
     let local_off = per_token_offset[i];
     let wg_base = workgroup_bases[wid.x];
-    var bit_off = 3u + wg_base + local_off;
+    var bit_off = hdr + wg_base + local_off;
 
     let len = tok >> 16u;
     let dist_or_byte = tok & 0xFFFFu;

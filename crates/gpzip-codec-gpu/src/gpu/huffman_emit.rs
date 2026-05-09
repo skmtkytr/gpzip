@@ -583,8 +583,8 @@ mod tests {
 
         eprintln!();
         eprintln!(
-            "{:<6} {:>7}  {:>9} {:>9} {:>9} {:>9}  {:>9}",
-            "wkld", "tokens", "host_dyn", "host_fix", "gpu_d1", "gpu_d2", "out_KiB"
+            "{:<6} {:>7}  {:>9} {:>9} {:>9} {:>9} {:>9}",
+            "wkld", "tokens", "host_dyn", "host_fix", "gpu_d1", "gpu_d2", "gpu_d3"
         );
         eprintln!("{}", "-".repeat(80));
 
@@ -599,6 +599,7 @@ mod tests {
                 let _ = encode_fixed_block(&walked).unwrap();
                 let _ = emit.emit_fixed_block(&walked);
                 let _ = emit_v2.emit_fixed_block_v2(&walked);
+                let _ = emit_v2.emit_dynamic_block_v3(&walked);
             }
 
             let iters = 32;
@@ -631,35 +632,40 @@ mod tests {
             }
             let d2_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
 
-            // Sanity: all four fixed-Huffman outputs must agree.
-            assert_eq!(
-                d1_out, fix_out,
-                "{name}: GPU D-1 must match host encode_fixed_block"
-            );
-            assert_eq!(
-                d2_out, fix_out,
-                "{name}: GPU D-2 must match host encode_fixed_block"
-            );
+            let t = Instant::now();
+            let mut d3_out = Vec::new();
+            for _ in 0..iters {
+                d3_out = emit_v2.emit_dynamic_block_v3(&walked).unwrap();
+            }
+            let d3_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+
+            // Sanity: fixed outputs must agree.
+            assert_eq!(d1_out, fix_out, "{name}: GPU D-1 must match host fixed");
+            assert_eq!(d2_out, fix_out, "{name}: GPU D-2 must match host fixed");
+            // D-3 vs host_dyn: bit-equivalent isn't required (different
+            // tree-build / RLE choices may differ), but they must decode
+            // to the same bytes. We also expect the sizes to be similar.
 
             eprintln!(
-                "{:<6} {:>7}  {:>7.3}ms {:>7.3}ms {:>7.3}ms {:>7.3}ms  fix={}KB dyn={}KB",
-                name,
-                n_tokens,
-                dyn_ms,
-                fix_ms,
-                d1_ms,
-                d2_ms,
+                "{:<6} {:>7}  {:>7.3}ms {:>7.3}ms {:>7.3}ms {:>7.3}ms {:>7.3}ms",
+                name, n_tokens, dyn_ms, fix_ms, d1_ms, d2_ms, d3_ms
+            );
+            eprintln!(
+                "        sizes (KiB): dyn={} fix={} d1={} d2={} d3={}",
+                dyn_out.len() / 1024,
                 fix_out.len() / 1024,
-                dyn_out.len() / 1024
+                d1_out.len() / 1024,
+                d2_out.len() / 1024,
+                d3_out.len() / 1024,
             );
         }
 
         eprintln!();
         eprintln!("Notes:");
-        eprintln!("  host_dyn = encode_block_fast (production, dynamic Huffman)");
-        eprintln!("  host_fix = encode_fixed_block (host, fixed Huffman)");
+        eprintln!("  host_dyn = encode_block_fast      (production, host, dynamic Huffman)");
+        eprintln!("  host_fix = encode_fixed_block     (host, fixed Huffman)");
         eprintln!("  gpu_d1   = emit_fixed_block       (GPU; host preps atom list)");
         eprintln!("  gpu_d2   = emit_fixed_block_v2    (GPU; bit_length + scan + emit all on GPU)");
-        eprintln!("  d1/d2/fix outputs are bit-identical (asserted).");
+        eprintln!("  gpu_d3   = emit_dynamic_block_v3  (GPU dynamic; finally apples-to-apples vs host_dyn)");
     }
 }

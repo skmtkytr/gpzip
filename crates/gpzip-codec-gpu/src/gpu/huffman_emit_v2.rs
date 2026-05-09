@@ -44,7 +44,12 @@ const WG_SIZE: u32 = 256;
 struct Params {
     n_tokens: u32,
     n_workgroups: u32,
-    _pad: [u32; 2],
+    /// Bit count of the host-pre-written block header at output[0..]; the
+    /// emit shader places token bits starting here. For fixed Huffman
+    /// the header is just BFINAL=1 + BTYPE=01 = 3 bits; for dynamic
+    /// (D-3) it's the full RFC 1951 §3.2.7 header.
+    header_bit_count: u32,
+    _pad: u32,
 }
 
 pub struct HuffmanEmitV2Pipeline {
@@ -158,7 +163,85 @@ impl HuffmanEmitV2Pipeline {
             return empty_fixed_block();
         }
 
-        // Pack tokens to u32 (length<<16 | dist_or_byte).
+        // Fixed-Huffman block header is just BFINAL=1 + BTYPE=01 = 0b011
+        // packed LSB-first, i.e. byte 0x03 (3 bits).
+        let header_bytes = vec![0x03u8];
+        let header_bit_count: u32 = 3;
+        let total_bits = total_bits_for_fixed(tokens);
+
+        self.dispatch_emit(
+            tokens,
+            &self.buf_lit_lens,
+            &self.buf_lit_codes_pre,
+            &self.buf_dist_lens,
+            &self.buf_dist_codes_pre,
+            &header_bytes,
+            header_bit_count,
+            total_bits,
+        )
+    }
+
+    /// D-3: dynamic-Huffman DEFLATE block, GPU-emitted. The host builds
+    /// the per-block Huffman trees + RFC 1951 §3.2.7 header bitstream
+    /// (same logic as `deflate::try_write_dynamic_block`'s header half),
+    /// then uploads the resulting code-length / pre-reversed-code arrays
+    /// and the header bytes; the GPU dispatch is identical to the fixed
+    /// path, just with different uploaded tables and a longer header.
+    ///
+    /// Returns `Err` if the Huffman tree exceeds DEFLATE's 15-bit cap
+    /// (extremely unusual; the caller can fall back to
+    /// `emit_fixed_block_v2`).
+    pub fn emit_dynamic_block_v3(&self, tokens: &[Token]) -> std::io::Result<Vec<u8>> {
+        if tokens.is_empty() {
+            return Ok(empty_fixed_block());
+        }
+        let dyn_h = build_dynamic_huffman(tokens)
+            .ok_or_else(|| std::io::Error::other("dynamic Huffman build failed (tree too tall)"))?;
+
+        let buf_lit_lens = self.upload_u32("v3-lit-lens", &dyn_h.lit_lens_u32);
+        let buf_lit_codes_pre = self.upload_u32("v3-lit-codes-pre", &dyn_h.lit_codes_pre);
+        let buf_dist_lens = self.upload_u32("v3-dist-lens", &dyn_h.dist_lens_u32);
+        let buf_dist_codes_pre = self.upload_u32("v3-dist-codes-pre", &dyn_h.dist_codes_pre);
+
+        let total_bits = dyn_h.header_bit_count as u64 + dyn_h.body_bit_count + dyn_h.eob_bits;
+        Ok(self.dispatch_emit(
+            tokens,
+            &buf_lit_lens,
+            &buf_lit_codes_pre,
+            &buf_dist_lens,
+            &buf_dist_codes_pre,
+            &dyn_h.header_bytes,
+            dyn_h.header_bit_count,
+            total_bits,
+        ))
+    }
+
+    fn upload_u32(&self, label: &str, data: &[u32]) -> wgpu::Buffer {
+        self.ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(data),
+                usage: wgpu::BufferUsages::STORAGE,
+            })
+    }
+
+    /// Shared 3-pass dispatch used by both fixed and dynamic emission.
+    /// Caller provides the four Huffman tables (already on-GPU), the
+    /// header byte stream + bit count, and the final total bit count
+    /// (used to trim the readback to the right byte length).
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_emit(
+        &self,
+        tokens: &[Token],
+        buf_lit_lens: &wgpu::Buffer,
+        buf_lit_codes_pre: &wgpu::Buffer,
+        buf_dist_lens: &wgpu::Buffer,
+        buf_dist_codes_pre: &wgpu::Buffer,
+        header_bytes: &[u8],
+        header_bit_count: u32,
+        total_bits: u64,
+    ) -> Vec<u8> {
         let packed: Vec<u32> = tokens
             .iter()
             .map(|t| (t.length << 16) | (t.distance & 0xFFFF))
@@ -167,19 +250,21 @@ impl HuffmanEmitV2Pipeline {
         let n_workgroups = n_tokens.div_ceil(WG_SIZE);
         assert!(
             n_workgroups <= WG_SIZE,
-            "v2 single-pass scan_totals only handles up to WG_SIZE workgroups; \
-             n_tokens={} requires {} workgroups (max {})",
-            n_tokens,
-            n_workgroups,
-            WG_SIZE
+            "v2/v3 single-pass scan_totals only handles ≤ WG_SIZE workgroups; \
+             n_tokens={n_tokens} requires {n_workgroups} (max {WG_SIZE})"
         );
 
-        // Output upper bound: 3 (header) + n_tokens * 32 (worst-case
-        // match emission) + 9 (EOB) bits, padded to u32 word boundary
-        // plus one slack word for the spillover branch in `write_bits`.
-        let max_bits = 3 + (n_tokens as u64) * 32 + 9;
+        // Output upper bound: header + n_tokens * 32 (worst-case match
+        // emission) + 16 (EOB up to 15 bits) + 1 spillover word.
+        let max_bits = (header_bit_count as u64) + (n_tokens as u64) * 32 + 16;
         let max_words = (max_bits as usize).div_ceil(32) + 1;
         let max_bytes = max_words * 4;
+
+        // Header buffer: pad to 4-byte multiple (wgpu copy alignment).
+        let mut header_padded = header_bytes.to_vec();
+        while header_padded.len() % 4 != 0 {
+            header_padded.push(0);
+        }
 
         let buf_tokens = self
             .ctx
@@ -188,6 +273,14 @@ impl HuffmanEmitV2Pipeline {
                 label: Some("v2-tokens"),
                 contents: bytemuck::cast_slice(&packed),
                 usage: wgpu::BufferUsages::STORAGE,
+            });
+        let buf_header = self
+            .ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("v2-header"),
+                contents: &header_padded,
+                usage: wgpu::BufferUsages::COPY_SRC,
             });
         let buf_per_token_offset = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("v2-per-token-offset"),
@@ -224,7 +317,8 @@ impl HuffmanEmitV2Pipeline {
         let params = Params {
             n_tokens,
             n_workgroups,
-            _pad: [0; 2],
+            header_bit_count,
+            _pad: 0,
         };
         let buf_params = self
             .ctx
@@ -243,10 +337,10 @@ impl HuffmanEmitV2Pipeline {
                 layout: &self.bind_group_layout,
                 entries: &[
                     bge(0, &buf_tokens),
-                    bge(1, &self.buf_lit_lens),
-                    bge(2, &self.buf_lit_codes_pre),
-                    bge(3, &self.buf_dist_lens),
-                    bge(4, &self.buf_dist_codes_pre),
+                    bge(1, buf_lit_lens),
+                    bge(2, buf_lit_codes_pre),
+                    bge(3, buf_dist_lens),
+                    bge(4, buf_dist_codes_pre),
                     bge(5, &self.buf_len_lut),
                     bge(6, &self.buf_dist_lut_lo),
                     bge(7, &self.buf_dist_lut_hi),
@@ -264,8 +358,12 @@ impl HuffmanEmitV2Pipeline {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("v2-enc"),
             });
+        // 1. Zero the output buffer (atomicOr later only sets bits).
         encoder.clear_buffer(&buf_output, 0, None);
-        // Pass 1: compute + local scan
+        // 2. Copy the host-built block header into output[0..header_bytes].
+        //    The padding zeros at the tail are fine — they don't add any bits.
+        encoder.copy_buffer_to_buffer(&buf_header, 0, &buf_output, 0, header_padded.len() as u64);
+        // 3. compute + local scan
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("v2-compute-scan-pass"),
@@ -275,7 +373,7 @@ impl HuffmanEmitV2Pipeline {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(n_workgroups, 1, 1);
         }
-        // Pass 2: scan workgroup totals (single workgroup, ≤ WG_SIZE entries)
+        // 4. scan workgroup totals (single workgroup)
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("v2-scan-totals-pass"),
@@ -285,7 +383,7 @@ impl HuffmanEmitV2Pipeline {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
-        // Pass 3: emit (one extra thread for EOB)
+        // 5. emit (one extra thread for EOB)
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("v2-emit-pass"),
@@ -310,9 +408,6 @@ impl HuffmanEmitV2Pipeline {
         drop(view);
         buf_staging.unmap();
 
-        // Compute total bits on host (cheap; same arithmetic the GPU
-        // did, no readback dance). Header + per-token + EOB.
-        let total_bits = total_bits_for_fixed(tokens);
         let n_bytes = (total_bits as usize).div_ceil(8);
         raw[..n_bytes].to_vec()
     }
@@ -586,6 +681,310 @@ fn empty_fixed_block() -> Vec<u8> {
 }
 
 // ============================================================
+// Dynamic Huffman header builder (D-3)
+// ============================================================
+
+use super::huffman::{canonical_codes, try_build_code_lengths};
+
+/// RFC 1951 §3.2.7: order in which the meta-Huffman code lengths are
+/// written.
+const META_ORDER: [usize; 19] = [
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+];
+
+/// Per-block state needed to dispatch the GPU emit shaders for a
+/// dynamic Huffman block: the per-symbol code lengths and pre-reversed
+/// codes that the shader looks up, plus the host-built header bitstream
+/// the shader writes verbatim before the per-token bits.
+pub(crate) struct DynamicHuffman {
+    pub lit_lens_u32: Vec<u32>,  // 286 → padded to 288 for alignment
+    pub lit_codes_pre: Vec<u32>, // pre-reversed canonical codes
+    pub dist_lens_u32: Vec<u32>, // 30 → padded to 32
+    pub dist_codes_pre: Vec<u32>,
+    pub header_bytes: Vec<u8>,
+    pub header_bit_count: u32,
+    /// Total per-token bits (sum of bit lengths emitted by the per-token
+    /// shader). Computed during the build pass alongside the frequencies.
+    pub body_bit_count: u64,
+    /// Bit count of the EOB code (the shader emits it after the body).
+    pub eob_bits: u64,
+}
+
+/// Build a dynamic-Huffman block's header + per-symbol lookup tables for
+/// `tokens`. Mirrors the header half of `deflate::try_write_dynamic_block`.
+/// Returns `None` if the natural Huffman tree exceeds the 15-bit DEFLATE
+/// cap (caller falls back to fixed encoding).
+pub(crate) fn build_dynamic_huffman(tokens: &[Token]) -> Option<DynamicHuffman> {
+    // 1. Frequencies. Always count EOB at least once. Bit count of the
+    // body is computed in step 4 below, after we have the code lengths.
+    let mut litlen_freq = [0u32; 286];
+    let mut dist_freq = [0u32; 30];
+    for tok in tokens {
+        if tok.is_literal() {
+            litlen_freq[tok.distance as usize] += 1;
+        } else {
+            let (lcode, _, _) = host_length_code(tok.length);
+            litlen_freq[lcode as usize] += 1;
+            let (dcode, _, _) = host_distance_code(tok.distance);
+            dist_freq[dcode as usize] += 1;
+        }
+    }
+    litlen_freq[256] += 1;
+
+    // 2. Length-limited Huffman trees (15-bit cap on litlen+dist, 7-bit
+    // on the meta-Huffman). If any fail, signal fallback.
+    let mut litlen_lens = try_build_code_lengths(&litlen_freq, 15)?;
+    let mut dist_lens = try_build_code_lengths(&dist_freq, 15)?;
+
+    // DEFLATE quirk: the distance Huffman tree must have at least two
+    // leaves (or be empty entirely with HDIST=0). Match the existing
+    // host fixup so we produce a decodable block in pathological
+    // single-distance cases.
+    let used_dist: usize = dist_lens.iter().filter(|&&l| l > 0).count();
+    if used_dist == 0 {
+        dist_lens[0] = 1;
+        dist_lens[1] = 1;
+    } else if used_dist == 1 {
+        let only = dist_lens.iter().position(|&l| l > 0).unwrap();
+        dist_lens[only] = 1;
+        dist_lens[1 - only.min(1)] = 1;
+    }
+    if litlen_lens.iter().filter(|&&l| l > 0).count() < 2 {
+        litlen_lens[0] = 1;
+        litlen_lens[256] = 1;
+    }
+
+    let litlen_codes = canonical_codes(&litlen_lens);
+    let dist_codes = canonical_codes(&dist_lens);
+
+    // 3. Pre-reverse codes for LSB-first packing.
+    let lit_codes_pre: Vec<u32> = litlen_codes
+        .iter()
+        .zip(&litlen_lens)
+        .map(|(&c, &l)| if l == 0 { 0 } else { rev_bits(c, l as u32) })
+        .collect();
+    let dist_codes_pre: Vec<u32> = dist_codes
+        .iter()
+        .zip(&dist_lens)
+        .map(|(&c, &l)| if l == 0 { 0 } else { rev_bits(c, l as u32) })
+        .collect();
+
+    // 4. Now that we have the code lengths, walk tokens once more to
+    //    sum per-token bits.
+    let mut body_bits: u64 = 0;
+    for tok in tokens {
+        if tok.is_literal() {
+            body_bits += litlen_lens[tok.distance as usize] as u64;
+        } else {
+            let (lcode, lextra, _) = host_length_code(tok.length);
+            body_bits += litlen_lens[lcode as usize] as u64 + lextra as u64;
+            let (dcode, dextra, _) = host_distance_code(tok.distance);
+            body_bits += dist_lens[dcode as usize] as u64 + dextra as u64;
+        }
+    }
+    let eob_bits = litlen_lens[256] as u64;
+
+    // 5. HLIT / HDIST = trim trailing zeros (keep min 257 / 1).
+    let nlit = trim_to_min(&litlen_lens, 257);
+    let ndist = trim_to_min(&dist_lens, 1);
+    let hlit = (nlit - 257) as u32;
+    let hdist = (ndist - 1) as u32;
+
+    // 6. RLE-encode the combined code-length sequence.
+    let mut combined = Vec::with_capacity(nlit + ndist);
+    combined.extend_from_slice(&litlen_lens[..nlit]);
+    combined.extend_from_slice(&dist_lens[..ndist]);
+    let rle = rle_encode_lengths(&combined);
+
+    // 7. Meta-Huffman from the RLE symbols (max 7-bit codes).
+    let mut meta_freq = [0u32; 19];
+    for e in &rle {
+        meta_freq[e.code as usize] += 1;
+    }
+    let meta_lens = try_build_code_lengths(&meta_freq, 7)?;
+    let meta_codes = canonical_codes(&meta_lens);
+
+    // 8. HCLEN: number of meta-Huffman code lengths to write, in
+    // META_ORDER. Trim trailing zeros but keep at least 4.
+    let mut hclen_count = 19;
+    while hclen_count > 4 && meta_lens[META_ORDER[hclen_count - 1]] == 0 {
+        hclen_count -= 1;
+    }
+    let hclen = (hclen_count - 4) as u32;
+
+    // 9. Write header bits: BFINAL=1, BTYPE=10 → 0b101, then HLIT (5),
+    // HDIST (5), HCLEN (4), then meta lens (3 bits each in META_ORDER),
+    // then the RLE-encoded code-length sequence (meta-Huffman emit +
+    // extra bits per RLE entry).
+    let mut bw = HostBitWriter::new();
+    bw.write_bits(0b101, 3);
+    bw.write_bits(hlit, 5);
+    bw.write_bits(hdist, 5);
+    bw.write_bits(hclen, 4);
+    for i in 0..hclen_count {
+        bw.write_bits(meta_lens[META_ORDER[i]] as u32, 3);
+    }
+    for e in &rle {
+        let code = meta_codes[e.code as usize];
+        let bits = meta_lens[e.code as usize] as u32;
+        bw.write_huffman(code, bits);
+        if e.extra_bits > 0 {
+            bw.write_bits(e.extra_value, e.extra_bits);
+        }
+    }
+    let header_bit_count = bw.bit_count();
+    let header_bytes = bw.into_bytes();
+
+    Some(DynamicHuffman {
+        lit_lens_u32: litlen_lens.iter().map(|&b| b as u32).collect(),
+        lit_codes_pre,
+        dist_lens_u32: dist_lens.iter().map(|&b| b as u32).collect(),
+        dist_codes_pre,
+        header_bytes,
+        header_bit_count,
+        body_bit_count: body_bits,
+        eob_bits,
+    })
+}
+
+/// Single RLE entry for the code-length sequence (RFC 1951 §3.2.7).
+/// Same shape as `deflate::RleEntry`.
+struct RleEntry {
+    code: u8,
+    extra_bits: u32,
+    extra_value: u32,
+}
+
+fn rle_encode_lengths(lens: &[u8]) -> Vec<RleEntry> {
+    let mut out = Vec::with_capacity(lens.len());
+    let mut i = 0;
+    while i < lens.len() {
+        let cur = lens[i];
+        let mut run = 1usize;
+        while i + run < lens.len() && lens[i + run] == cur {
+            run += 1;
+        }
+        if cur == 0 {
+            while run >= 11 {
+                let n = run.min(138);
+                out.push(RleEntry {
+                    code: 18,
+                    extra_bits: 7,
+                    extra_value: (n - 11) as u32,
+                });
+                run -= n;
+                i += n;
+            }
+            while run >= 3 {
+                let n = run.min(10);
+                out.push(RleEntry {
+                    code: 17,
+                    extra_bits: 3,
+                    extra_value: (n - 3) as u32,
+                });
+                run -= n;
+                i += n;
+            }
+            while run > 0 {
+                out.push(RleEntry {
+                    code: 0,
+                    extra_bits: 0,
+                    extra_value: 0,
+                });
+                run -= 1;
+                i += 1;
+            }
+        } else {
+            out.push(RleEntry {
+                code: cur,
+                extra_bits: 0,
+                extra_value: 0,
+            });
+            i += 1;
+            run -= 1;
+            while run >= 3 {
+                let n = run.min(6);
+                out.push(RleEntry {
+                    code: 16,
+                    extra_bits: 2,
+                    extra_value: (n - 3) as u32,
+                });
+                run -= n;
+                i += n;
+            }
+            while run > 0 {
+                out.push(RleEntry {
+                    code: cur,
+                    extra_bits: 0,
+                    extra_value: 0,
+                });
+                run -= 1;
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn trim_to_min(lens: &[u8], min: usize) -> usize {
+    let mut n = lens.len();
+    while n > min && lens[n - 1] == 0 {
+        n -= 1;
+    }
+    n
+}
+
+/// Tiny DEFLATE-conventions bit writer used only to build the dynamic
+/// header bitstream on the host. The token body is built on the GPU.
+struct HostBitWriter {
+    out: Vec<u8>,
+    accum: u32,
+    nbits: u32,
+    total: u32,
+}
+
+impl HostBitWriter {
+    fn new() -> Self {
+        Self {
+            out: Vec::new(),
+            accum: 0,
+            nbits: 0,
+            total: 0,
+        }
+    }
+    fn write_bits(&mut self, value: u32, count: u32) {
+        debug_assert!(count <= 24);
+        self.accum |= (value & ((1u32 << count) - 1)) << self.nbits;
+        self.nbits += count;
+        self.total += count;
+        while self.nbits >= 8 {
+            self.out.push((self.accum & 0xff) as u8);
+            self.accum >>= 8;
+            self.nbits -= 8;
+        }
+    }
+    fn write_huffman(&mut self, code: u32, bits: u32) {
+        // Huffman codes are MSB-first per RFC 1951; reverse to LSB-first.
+        let mut reversed = 0u32;
+        for i in 0..bits {
+            if (code >> i) & 1 != 0 {
+                reversed |= 1 << (bits - 1 - i);
+            }
+        }
+        self.write_bits(reversed, bits);
+    }
+    fn bit_count(&self) -> u32 {
+        self.total
+    }
+    fn into_bytes(mut self) -> Vec<u8> {
+        if self.nbits > 0 {
+            self.out.push((self.accum & 0xff) as u8);
+        }
+        self.out
+    }
+}
+
+// ============================================================
 // Bind-group helpers
 // ============================================================
 
@@ -721,5 +1120,77 @@ mod tests {
             .map(|i| Token::literal((i & 0xff) as u8))
             .collect();
         round_trip(&tokens);
+    }
+
+    /// D-3: dynamic Huffman round-trips. Same shader as v2 (fixed),
+    /// just with dynamically-built per-block code lengths and a longer
+    /// header. Output must be valid DEFLATE → reconstructs to original.
+    fn round_trip_v3(tokens: &[Token]) {
+        let Some(p) = try_pipeline() else {
+            eprintln!("no GPU — skipping v3");
+            return;
+        };
+        let deflate_bytes = p
+            .emit_dynamic_block_v3(tokens)
+            .expect("dynamic Huffman build");
+        let mut decoded = Vec::new();
+        DeflateDecoder::new(&deflate_bytes[..])
+            .read_to_end(&mut decoded)
+            .expect("flate2 should decode v3 GPU-emitted DEFLATE");
+        let expected = reconstruct(tokens);
+        assert_eq!(
+            decoded,
+            expected,
+            "v3 GPU dynamic round-trip mismatch on {} tokens",
+            tokens.len()
+        );
+    }
+
+    #[test]
+    fn v3_literals_only() {
+        let tokens: Vec<Token> = (0..64u8).map(Token::literal).collect();
+        round_trip_v3(&tokens);
+    }
+
+    #[test]
+    fn v3_single_back_ref() {
+        let mut tokens: Vec<Token> = b"hello, ".iter().map(|&b| Token::literal(b)).collect();
+        tokens.push(Token::back_ref(5, 7));
+        round_trip_v3(&tokens);
+    }
+
+    #[test]
+    fn v3_many_back_refs_with_extra_bits() {
+        let mut tokens: Vec<Token> = Vec::new();
+        for i in 0..512u32 {
+            tokens.push(Token::literal((i & 0xff) as u8));
+        }
+        for &(len, dist) in &[(3, 1), (11, 5), (35, 17), (131, 257)] {
+            tokens.push(Token::back_ref(len, dist));
+        }
+        round_trip_v3(&tokens);
+    }
+
+    #[test]
+    fn v3_skewed_frequencies() {
+        // Heavy bias toward a few literal values exercises the
+        // length-limited Huffman path more than uniform input does.
+        let mut tokens: Vec<Token> = Vec::new();
+        for _ in 0..2000 {
+            tokens.push(Token::literal(b'x'));
+        }
+        for i in 0..32u32 {
+            tokens.push(Token::literal((i & 0xff) as u8));
+        }
+        round_trip_v3(&tokens);
+    }
+
+    #[test]
+    fn v3_multi_workgroup() {
+        // Realistic-ish: many literals across workgroup boundary.
+        let tokens: Vec<Token> = (0..4096u32)
+            .map(|i| Token::literal((i & 0xff) as u8))
+            .collect();
+        round_trip_v3(&tokens);
     }
 }
