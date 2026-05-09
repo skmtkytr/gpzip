@@ -37,15 +37,23 @@ Measured on a 16-core box, 200 MB mixed input, level 5:
 
 `--backend gpu` runs LZ77 match-finding on the GPU via wgpu (Vulkan / Metal
 / DX12 — cross-vendor). The host then encodes the GPU-emitted token stream
-into a fixed-Huffman DEFLATE block (RFC 1951 §3.2.6) and frames it as a
+into a dynamic-Huffman DEFLATE block (RFC 1951 §3.2.7) and frames it as a
 standard gzip member (RFC 1952). Output is normal gzip; `gzip -t` and
 `tar tzf` accept it.
 
-The shader is brute-force today (O(window) per byte, 4 KiB window), so the
-GPU path is functional but slower than the CPU path on every input we've
-benchmarked. The point is the integration: a hash-table LZ77 shader and a
-GPU-side Huffman pass plug into the same pipeline without disturbing the
-gzip output contract.
+The match-finder is a two-pass hash-table shader: pass 1 writes each
+position into a 4-way bucket (atomicMin per sub-slot; oldest-wins lock-free
+build), pass 2 looks up all 4 sub-slots and picks the closest prior
+position. Closer matches than ideal would need a real hash chain
+(atomicCAS-based linked-list inserts), and the encoder side could use
+package-merge length-limiting instead of frequency scaling — both are
+future work.
+
+Today's GPU path is correct everywhere (binary, text, random — all
+round-trip and pass `gzip -t`) but compression ratio is workload-dependent:
+near-CPU on binaries, much worse on highly repetitive input where every
+position eventually back-references the chunk start. CPU still wins on
+both speed and ratio for now.
 
 ## Flags
 
@@ -82,9 +90,9 @@ Output: `./target/release/gpzip`.
 
 ## Status
 
-Pre-alpha. CPU pipeline works and is fast. GPU pipeline produces valid
-gzip but is slow until the brute-force LZ77 shader gets replaced with a
-hash-table variant.
+Pre-alpha. CPU pipeline is fast and produces standard output. GPU
+pipeline is functional and produces standard output — speed and ratio
+both still trail CPU on every workload measured.
 
 ## License
 
