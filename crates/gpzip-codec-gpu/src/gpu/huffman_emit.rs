@@ -535,6 +535,7 @@ mod tests {
     fn bench_emit_vs_host() {
         use crate::gpu::context::GpuContext;
         use crate::gpu::deflate::{encode_block_fast, encode_fixed_block};
+        use crate::gpu::huffman_emit_v2::HuffmanEmitV2Pipeline;
         use crate::gpu::lz77::greedy_walk;
         use crate::gpu::lz77_hash::{Lz77HashPipeline, DEFAULT_WINDOW};
         use std::sync::Arc;
@@ -547,6 +548,7 @@ mod tests {
         let ctx = Arc::new(ctx);
         let lz77 = Lz77HashPipeline::new(Arc::clone(&ctx));
         let emit = HuffmanEmitPipeline::new(Arc::clone(&ctx));
+        let emit_v2 = HuffmanEmitV2Pipeline::new(Arc::clone(&ctx));
 
         let chunk = 32 * 1024usize;
         let workloads: Vec<(&str, Vec<u8>)> = vec![
@@ -581,21 +583,22 @@ mod tests {
 
         eprintln!();
         eprintln!(
-            "{:<6} {:>7}  {:>10} {:>10} {:>10}  {:>9} {:>9} {:>9}",
-            "wkld", "tokens", "host_dyn", "host_fix", "gpu_d1", "dyn_KiB", "fix_KiB", "d1_KiB"
+            "{:<6} {:>7}  {:>9} {:>9} {:>9} {:>9}  {:>9}",
+            "wkld", "tokens", "host_dyn", "host_fix", "gpu_d1", "gpu_d2", "out_KiB"
         );
-        eprintln!("{}", "-".repeat(85));
+        eprintln!("{}", "-".repeat(80));
 
         for (name, data) in &workloads {
             let raw = lz77.match_find(data, DEFAULT_WINDOW);
             let walked = greedy_walk(&raw, data);
             let n_tokens = walked.len();
 
-            // Warm both encoders.
+            // Warm all encoders.
             for _ in 0..2 {
                 let _ = encode_block_fast(&walked).unwrap();
                 let _ = encode_fixed_block(&walked).unwrap();
                 let _ = emit.emit_fixed_block(&walked);
+                let _ = emit_v2.emit_fixed_block_v2(&walked);
             }
 
             let iters = 32;
@@ -621,30 +624,42 @@ mod tests {
             }
             let d1_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
 
-            // Sanity: D-1 output should match host fixed-block byte-for-byte.
+            let t = Instant::now();
+            let mut d2_out = Vec::new();
+            for _ in 0..iters {
+                d2_out = emit_v2.emit_fixed_block_v2(&walked);
+            }
+            let d2_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+
+            // Sanity: all four fixed-Huffman outputs must agree.
             assert_eq!(
                 d1_out, fix_out,
-                "{name}: GPU D-1 must produce identical bytes to host encode_fixed_block"
+                "{name}: GPU D-1 must match host encode_fixed_block"
+            );
+            assert_eq!(
+                d2_out, fix_out,
+                "{name}: GPU D-2 must match host encode_fixed_block"
             );
 
             eprintln!(
-                "{:<6} {:>7}  {:>9.3}ms {:>9.3}ms {:>9.3}ms  {:>9} {:>9} {:>9}",
+                "{:<6} {:>7}  {:>7.3}ms {:>7.3}ms {:>7.3}ms {:>7.3}ms  fix={}KB dyn={}KB",
                 name,
                 n_tokens,
                 dyn_ms,
                 fix_ms,
                 d1_ms,
-                dyn_out.len(),
-                fix_out.len(),
-                d1_out.len()
+                d2_ms,
+                fix_out.len() / 1024,
+                dyn_out.len() / 1024
             );
         }
 
         eprintln!();
         eprintln!("Notes:");
         eprintln!("  host_dyn = encode_block_fast (production, dynamic Huffman)");
-        eprintln!("  host_fix = encode_fixed_block (host, fixed Huffman, A/B baseline for D-1)");
-        eprintln!("  gpu_d1   = emit_fixed_block (GPU shader, fixed Huffman)");
-        eprintln!("  Output sizes should be: fix == d1 (bit-identical), dyn typically smaller.");
+        eprintln!("  host_fix = encode_fixed_block (host, fixed Huffman)");
+        eprintln!("  gpu_d1   = emit_fixed_block       (GPU; host preps atom list)");
+        eprintln!("  gpu_d2   = emit_fixed_block_v2    (GPU; bit_length + scan + emit all on GPU)");
+        eprintln!("  d1/d2/fix outputs are bit-identical (asserted).");
     }
 }

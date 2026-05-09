@@ -70,11 +70,20 @@ impl GpuContext {
 
         let adapter = pick_adapter(&instance)?;
 
+        // The huffman_emit_v2 pipeline binds 12 storage buffers in one
+        // bind group (one per LUT + working buffers); wgpu's default
+        // `max_storage_buffers_per_shader_stage` is 8. Bump to 16 — RTX
+        // 4090 supports 1M, and any reasonable Vulkan / Metal / DX12
+        // device exposes ≥ 16. If a target adapter caps lower, we'd
+        // surface DeviceRequest and the CLI can fall back to CPU.
+        let mut required_limits = wgpu::Limits::default();
+        required_limits.max_storage_buffers_per_shader_stage = 16;
+
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("gpzip-gpu"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits,
             },
             None,
         ))
