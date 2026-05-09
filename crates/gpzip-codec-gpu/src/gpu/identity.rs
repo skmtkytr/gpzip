@@ -1,5 +1,7 @@
 //! Identity compute pipeline. Bytes go up to the GPU and come back
-//! unchanged — bring-up scaffolding for the real LZ77 / Huffman shaders.
+//! unchanged — bring-up scaffolding kept around as a known-good plumbing
+//! test. The production gzip path uses the LZ77 pipeline.
+#![allow(dead_code)]
 
 use std::sync::Arc;
 
