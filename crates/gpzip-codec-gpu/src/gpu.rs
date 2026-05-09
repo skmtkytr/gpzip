@@ -130,15 +130,17 @@ impl GpuBackend {
             ctx,
             lz77,
             batched,
-            // 32 KiB: matches the DEFLATE window. Keeping chunk <= window
-            // means every prior position in the chunk is potentially a
-            // valid back-reference (no distance-out-of-window filter), so
-            // the GPU hash chain finds matches reliably even though chain
-            // entries aren't ordered by position. Larger chunks (512 KiB)
-            // hide most candidates behind the distance filter and tank
-            // compression ratio on repetitive data — measured with chain
-            // walks up to 1024 entries it still couldn't recover.
-            chunk_size: 32 * 1024,
+            // 256 KiB. Rationale: GPU dispatch overhead is roughly fixed
+            // per BatchedLz77 submission (~150 µs poll + ~50 µs misc),
+            // so per-byte cost scales with 1/chunk_size. The original
+            // 32 KiB cap was set because a hash-chain design lost match
+            // quality past chunk > window; the segmented-hash design we
+            // settled on bounds lookup walks by window (lookup walks at
+            // most window/SEG_SIZE = 8 segments back), so larger chunks
+            // don't hurt match quality. The new HuffmanEmitV2 encoder's
+            // single-pass scan extends to n_workgroups ≤ WG_SIZE = 1024
+            // i.e. 1M tokens per chunk.
+            chunk_size: 128 * 1024,
             // 16: lets ParallelChunkedWriter dispatch enough chunks for
             // BatchedLz77 to keep filling batches back-to-back. Measured
             // 5-trial averages on 64 MB workloads: 8→16 saved 6% wall on

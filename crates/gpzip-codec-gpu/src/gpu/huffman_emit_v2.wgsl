@@ -50,7 +50,13 @@ struct Params {
 @group(0) @binding(11) var<storage, read_write> output:           array<atomic<u32>>;
 @group(0) @binding(12) var<uniform>             params:           Params;
 
-const WG_SIZE: u32 = 256u;
+// WG_SIZE = 1024 lets single-pass scan_totals (1 workgroup of WG_SIZE
+// threads scanning workgroup_totals) cover up to WG_SIZE^2 = 1M tokens.
+// Default wgpu max_compute_invocations_per_workgroup is 256, so the
+// host requests max=1024 in GpuContext::try_init. Modern Vulkan / Metal
+// / DX12 devices support 1024 (RTX 4090 supports 1024+; older iGPUs
+// may not, where the device init falls back to CPU automatically).
+const WG_SIZE: u32 = 1024u;
 
 fn token_bits(tok: u32) -> u32 {
     let len = tok >> 16u;
@@ -84,7 +90,7 @@ fn token_bits(tok: u32) -> u32 {
 
 var<workgroup> shared_bits: array<u32, WG_SIZE>;
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(1024)
 fn compute_and_local_scan(@builtin(global_invocation_id) gid: vec3<u32>,
                           @builtin(local_invocation_id) lid: vec3<u32>,
                           @builtin(workgroup_id) wid: vec3<u32>) {
@@ -130,7 +136,7 @@ fn compute_and_local_scan(@builtin(global_invocation_id) gid: vec3<u32>,
 
 var<workgroup> shared_totals: array<u32, WG_SIZE>;
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(1024)
 fn scan_totals(@builtin(local_invocation_id) lid: vec3<u32>) {
     let l = lid.x;
 
@@ -184,7 +190,7 @@ fn write_bits(bit_offset: u32, value: u32, n_bits: u32) {
     }
 }
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(1024)
 fn emit(@builtin(global_invocation_id) gid: vec3<u32>,
         @builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {

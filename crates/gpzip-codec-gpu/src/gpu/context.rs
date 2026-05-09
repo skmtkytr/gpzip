@@ -76,8 +76,16 @@ impl GpuContext {
         // 4090 supports 1M, and any reasonable Vulkan / Metal / DX12
         // device exposes ≥ 16. If a target adapter caps lower, we'd
         // surface DeviceRequest and the CLI can fall back to CPU.
+        //
+        // The same shader uses workgroup_size(1024) so the single-pass
+        // scan_totals can cover up to 1M tokens per chunk. Default wgpu
+        // `max_compute_invocations_per_workgroup` is 256; modern desktop
+        // GPUs expose 1024 — same fallback story as above for older /
+        // mobile adapters that cap lower.
         let mut required_limits = wgpu::Limits::default();
         required_limits.max_storage_buffers_per_shader_stage = 16;
+        required_limits.max_compute_invocations_per_workgroup = 1024;
+        required_limits.max_compute_workgroup_size_x = 1024;
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {

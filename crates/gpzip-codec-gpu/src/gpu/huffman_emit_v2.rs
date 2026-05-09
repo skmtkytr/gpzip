@@ -50,7 +50,11 @@ const MAX_OUTPUT_BYTES: usize = MAX_TOKENS * 4 + 1024;
 const MAX_HEADER_BYTES: usize = 1024;
 
 const SHADER: &str = include_str!("huffman_emit_v2.wgsl");
-const WG_SIZE: u32 = 256;
+// WG_SIZE = 1024 (was 256) to extend single-pass scan_totals coverage
+// to up to WG_SIZE^2 = 1 048 576 tokens. Lets the GPU pipeline run on
+// chunks larger than 32 KiB without needing a multi-level scan kernel.
+// `GpuContext::try_init` requests the matching wgpu limit.
+const WG_SIZE: u32 = 1024;
 
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
