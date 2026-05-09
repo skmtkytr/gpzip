@@ -51,7 +51,13 @@ fn backends_from_env() -> wgpu::Backends {
         Ok("dx12") => wgpu::Backends::DX12,
         Ok("gl") => wgpu::Backends::GL,
         Ok("browser_webgpu") => wgpu::Backends::BROWSER_WEBGPU,
-        _ => wgpu::Backends::all(),
+        Ok("all") => wgpu::Backends::all(),
+        // Default = PRIMARY (Vulkan / Metal / DX12). Excludes the GLES
+        // backend, which on Wayland boxes intermittently fails to
+        // initialize via EGL when no surface is attached and trips
+        // wgpu's gles::egl into a panic. Tests on those hosts hit this.
+        // Set GPZIP_GPU_BACKEND=all to opt back in.
+        _ => wgpu::Backends::PRIMARY,
     }
 }
 

@@ -16,6 +16,7 @@ mod chunk;
 mod context;
 mod deflate;
 mod huffman;
+mod huffman_emit;
 mod identity;
 mod lz77;
 mod lz77_hash;
