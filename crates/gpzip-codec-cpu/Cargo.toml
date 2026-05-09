@@ -16,6 +16,9 @@ xz2.workspace = true
 bzip2.workspace = true
 unrar.workspace = true
 tracing.workspace = true
+rayon.workspace = true
+crossbeam-channel.workspace = true
+num_cpus.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

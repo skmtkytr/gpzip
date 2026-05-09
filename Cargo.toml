@@ -35,6 +35,10 @@ clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 humansize = "2"
 
+# Parallelism
+rayon = "1"
+num_cpus = "1"
+
 # GPU
 wgpu = "0.19"
 pollster = "0.3"

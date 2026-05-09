@@ -8,12 +8,26 @@ use gpzip_codec_gpu::GpuBackend;
 use gpzip_core::archive;
 use gpzip_core::BackendRegistry;
 
+const DEFAULT_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+
 #[derive(Parser, Debug)]
 #[command(name = "gpzip", version, about = "GPU-accelerated archiver")]
 struct Cli {
     /// Backend selection. `auto` prefers GPU when available.
     #[arg(long, value_enum, default_value_t = BackendChoice::Auto, global = true)]
     backend: BackendChoice,
+
+    /// Worker threads for parallel chunk compression. 0 = number of CPU cores.
+    /// `1` forces serial compression (one chunk in flight).
+    #[arg(long, default_value_t = 0, global = true)]
+    threads: usize,
+
+    /// Per-chunk size in bytes for parallel compression. Each chunk is an
+    /// independently-decodable gzip member or zstd frame, so output stays
+    /// compatible with standard tools. Larger = better compression ratio,
+    /// less parallelism. Default 2 MiB.
+    #[arg(long, default_value_t = DEFAULT_CHUNK_BYTES, global = true)]
+    chunk_size: usize,
 
     #[command(subcommand)]
     command: Command,
@@ -50,7 +64,15 @@ enum Command {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    let registry = build_registry(cli.backend);
+    let threads = if cli.threads == 0 {
+        num_cpus::get().max(1)
+    } else {
+        cli.threads
+    };
+    if cli.chunk_size == 0 {
+        return Err(anyhow!("--chunk-size must be > 0"));
+    }
+    let registry = build_registry(cli.backend, cli.chunk_size, threads);
 
     match cli.command {
         Command::A {
@@ -85,22 +107,16 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn build_registry(choice: BackendChoice) -> BackendRegistry {
+fn build_registry(choice: BackendChoice, chunk_size: usize, threads: usize) -> BackendRegistry {
     let mut r = BackendRegistry::new();
-    let cpu: Arc<dyn gpzip_core::CodecBackend> = Arc::new(CpuBackend::new());
+    let cpu: Arc<dyn gpzip_core::CodecBackend> =
+        Arc::new(CpuBackend::with_config(chunk_size, threads));
 
     match choice {
         BackendChoice::Cpu => {
             r.push(cpu);
         }
-        BackendChoice::Gpu => {
-            if let Ok(gpu) = GpuBackend::try_init() {
-                r.push(Arc::new(gpu));
-            }
-            r.push(cpu);
-        }
-        BackendChoice::Auto => {
-            // Prefer GPU when it initializes; fall through to CPU otherwise.
+        BackendChoice::Gpu | BackendChoice::Auto => {
             if let Ok(gpu) = GpuBackend::try_init() {
                 r.push(Arc::new(gpu));
             }

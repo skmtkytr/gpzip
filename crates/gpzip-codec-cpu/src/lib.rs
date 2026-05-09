@@ -7,5 +7,7 @@
 mod backend;
 mod compress;
 mod decompress;
+mod parallel;
 
 pub use backend::CpuBackend;
+pub use parallel::{ChunkFn, ParallelChunkedWriter};

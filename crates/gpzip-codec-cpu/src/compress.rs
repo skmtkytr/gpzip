@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::sync::Arc;
 
 use flate2::{
     write::{DeflateEncoder, GzEncoder},
@@ -6,6 +7,10 @@ use flate2::{
 };
 use gpzip_core::{Algorithm, Compressor, Level};
 
+use crate::parallel::{ChunkFn, ParallelChunkedWriter};
+
+/// Raw DEFLATE (no framing). Used inside per-entry ZIP compression.
+/// Serial; ZIP doesn't allow chunking within a single entry.
 pub struct DeflateCompressor {
     level: Level,
 }
@@ -24,13 +29,21 @@ impl Compressor for DeflateCompressor {
     }
 }
 
-/// Gzip-wrapped DEFLATE. Used for `.tar.gz` / `.gz`.
+/// Gzip-wrapped DEFLATE. Used for `.tar.gz` / `.gz`. Chunk-parallel: each
+/// chunk becomes an independent gzip member; standard gunzip / MultiGzDecoder
+/// concatenates them transparently (RFC 1952 §2.2).
 pub struct GzipCompressor {
     level: Level,
+    chunk_size: usize,
+    max_in_flight: usize,
 }
 impl GzipCompressor {
-    pub fn new(level: Level) -> Self {
-        Self { level }
+    pub fn new(level: Level, chunk_size: usize, max_in_flight: usize) -> Self {
+        Self {
+            level,
+            chunk_size,
+            max_in_flight,
+        }
     }
 }
 impl Compressor for GzipCompressor {
@@ -39,16 +52,34 @@ impl Compressor for GzipCompressor {
     }
     fn wrap_writer(self: Box<Self>, w: Box<dyn Write + Send>) -> Box<dyn Write + Send> {
         let lvl = self.level.clamp_to(0, 9) as u32;
-        Box::new(GzEncoder::new(w, Compression::new(lvl)))
+        let chunk_fn: ChunkFn = Arc::new(move |bytes: &[u8]| {
+            let mut e = GzEncoder::new(Vec::with_capacity(bytes.len() / 2), Compression::new(lvl));
+            e.write_all(bytes)?;
+            e.finish()
+        });
+        Box::new(ParallelChunkedWriter::new(
+            w,
+            self.chunk_size,
+            self.max_in_flight,
+            chunk_fn,
+        ))
     }
 }
 
+/// Zstd. Used for `.tar.zst`. Chunk-parallel via concatenated zstd frames
+/// (zstd format permits multiple frames in one stream).
 pub struct ZstdCompressor {
     level: Level,
+    chunk_size: usize,
+    max_in_flight: usize,
 }
 impl ZstdCompressor {
-    pub fn new(level: Level) -> Self {
-        Self { level }
+    pub fn new(level: Level, chunk_size: usize, max_in_flight: usize) -> Self {
+        Self {
+            level,
+            chunk_size,
+            max_in_flight,
+        }
     }
 }
 impl Compressor for ZstdCompressor {
@@ -56,9 +87,8 @@ impl Compressor for ZstdCompressor {
         Algorithm::Zstd
     }
     fn wrap_writer(self: Box<Self>, w: Box<dyn Write + Send>) -> Box<dyn Write + Send> {
-        // zstd levels: 1..=22, 3 default. Map our 0..=9 to a useful sub-range.
-        // 0 -> 1, 5 -> 3 (default), 9 -> 19 (high effort but not max-22).
-        let mapped = match self.level.0 {
+        // Map our 0..=9 onto zstd's 1..=22 with sensible defaults.
+        let mapped: i32 = match self.level.0 {
             0 => 1,
             1..=4 => 2,
             5 => 3,
@@ -67,11 +97,17 @@ impl Compressor for ZstdCompressor {
             8 => 17,
             _ => 19,
         };
-        // AutoFinishEncoder finalizes the frame on drop.
-        Box::new(
-            zstd::stream::write::Encoder::new(w, mapped)
-                .expect("zstd encoder init")
-                .auto_finish(),
-        )
+        let chunk_fn: ChunkFn = Arc::new(move |bytes: &[u8]| {
+            let mut e =
+                zstd::stream::write::Encoder::new(Vec::with_capacity(bytes.len() / 2), mapped)?;
+            e.write_all(bytes)?;
+            e.finish()
+        });
+        Box::new(ParallelChunkedWriter::new(
+            w,
+            self.chunk_size,
+            self.max_in_flight,
+            chunk_fn,
+        ))
     }
 }

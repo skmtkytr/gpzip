@@ -8,13 +8,42 @@ use crate::decompress::{
     ZstdDecompressor,
 };
 
-#[derive(Default, Clone, Copy)]
-pub struct CpuBackend;
+/// Default chunk size for parallel compression. Matches cozip's CMP starting
+/// point of 2 MiB; large enough that ratio loss vs serial is small (~1-2%),
+/// small enough that even small files get some chunking.
+pub const DEFAULT_CHUNK_SIZE: usize = 2 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+pub struct CpuBackend {
+    chunk_size: usize,
+    max_in_flight: usize,
+}
+
+impl Default for CpuBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl CpuBackend {
     pub const NAME: &'static str = "cpu";
+
     pub fn new() -> Self {
-        Self
+        Self {
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            max_in_flight: num_cpus::get().max(1),
+        }
+    }
+
+    /// Configure parallelism. `max_in_flight = 1` is effectively serial.
+    /// `chunk_size` of 0 is rejected (would deadlock the writer).
+    pub fn with_config(chunk_size: usize, max_in_flight: usize) -> Self {
+        assert!(chunk_size > 0, "chunk_size must be > 0");
+        assert!(max_in_flight > 0, "max_in_flight must be > 0");
+        Self {
+            chunk_size,
+            max_in_flight,
+        }
     }
 }
 
@@ -36,9 +65,21 @@ impl CodecBackend for CpuBackend {
 
     fn compressor(&self, algo: Algorithm, level: Level) -> Result<Box<dyn Compressor>> {
         match algo {
+            // Raw deflate has no member framing, so per-chunk concat would
+            // not be readable by zip-rs. Keep it serial.
             Algorithm::Deflate => Ok(Box::new(DeflateCompressor::new(level))),
-            Algorithm::Gzip => Ok(Box::new(GzipCompressor::new(level))),
-            Algorithm::Zstd => Ok(Box::new(ZstdCompressor::new(level))),
+            // Gzip and zstd both support concatenated members/frames as part
+            // of their formats — perfect for chunk-parallel output.
+            Algorithm::Gzip => Ok(Box::new(GzipCompressor::new(
+                level,
+                self.chunk_size,
+                self.max_in_flight,
+            ))),
+            Algorithm::Zstd => Ok(Box::new(ZstdCompressor::new(
+                level,
+                self.chunk_size,
+                self.max_in_flight,
+            ))),
             Algorithm::Lzma | Algorithm::Bzip2 | Algorithm::Rar => {
                 Err(Error::CompressionUnsupported {
                     backend: Self::NAME,
