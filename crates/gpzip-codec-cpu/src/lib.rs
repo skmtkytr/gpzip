@@ -8,6 +8,7 @@ mod backend;
 mod compress;
 mod decompress;
 mod parallel;
+mod parallel_decompress;
 mod rar;
 mod sevenz;
 
