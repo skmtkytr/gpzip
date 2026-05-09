@@ -13,7 +13,7 @@
 //! byte. The host's `greedy_walk` and the rest of the gzip pipeline are
 //! shared between brute-force and hash variants.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -58,6 +58,72 @@ pub struct Lz77HashPipeline {
     lookup_pipeline: wgpu::ComputePipeline,
     build_layout: wgpu::BindGroupLayout,
     lookup_layout: wgpu::BindGroupLayout,
+    /// Reusable buffer sets — see `BufferSet`. The pool is a stack: most
+    /// recently released entry is reused next, so caches stay warm.
+    pool: Mutex<Vec<BufferSet>>,
+    /// Pre-staged buffer of all-`0xff` bytes, used to reset the hash table
+    /// between chunks via `copy_buffer_to_buffer` instead of a fresh upload.
+    reset_blob: wgpu::Buffer,
+}
+
+/// One set of GPU buffers sized for a single chunk. The pool reuses these
+/// across `match_find` calls so we stop paying buffer-creation overhead on
+/// every chunk (was ~5-10 ms / chunk per profiling).
+struct BufferSet {
+    input: wgpu::Buffer,
+    hash_table: wgpu::Buffer,
+    tokens: wgpu::Buffer,
+    staging: wgpu::Buffer,
+    params: wgpu::Buffer,
+    /// Number of input bytes the buffers were allocated for. A set can
+    /// service requests up to this size; smaller chunks just leave the tail
+    /// of the buffer unused. Larger chunks need a fresh, bigger set.
+    capacity_bytes: usize,
+}
+
+impl BufferSet {
+    fn new(ctx: &GpuContext, capacity_bytes: usize) -> Self {
+        let padded = capacity_bytes.next_multiple_of(4);
+        let input = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpzip-lz77-pool-input"),
+            size: padded as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let hash_table = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpzip-lz77-pool-hash"),
+            size: (HASH_SIZE * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let token_bytes = (capacity_bytes as u64) * (std::mem::size_of::<Token>() as u64);
+        let tokens = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpzip-lz77-pool-tokens"),
+            size: token_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpzip-lz77-pool-staging"),
+            size: token_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let params = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpzip-lz77-pool-params"),
+            size: std::mem::size_of::<Params>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self {
+            input,
+            hash_table,
+            tokens,
+            staging,
+            params,
+            capacity_bytes,
+        }
+    }
 }
 
 impl Lz77HashPipeline {
@@ -131,62 +197,69 @@ impl Lz77HashPipeline {
                     entry_point: "lookup",
                 });
 
+        // Pre-stage one buffer of all-0xff bytes for fast hash-table reset.
+        let reset_blob = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("gpzip-lz77-hash-reset-blob"),
+                contents: &vec![0xffu8; HASH_SIZE * 4],
+                usage: wgpu::BufferUsages::COPY_SRC,
+            });
+
         Self {
             ctx,
             build_pipeline,
             lookup_pipeline,
             build_layout,
             lookup_layout,
+            pool: Mutex::new(Vec::new()),
+            reset_blob,
+        }
+    }
+
+    fn acquire(&self, capacity_bytes: usize) -> BufferSet {
+        let mut pool = self.pool.lock().unwrap();
+        if let Some(idx) = pool.iter().position(|s| s.capacity_bytes >= capacity_bytes) {
+            return pool.swap_remove(idx);
+        }
+        drop(pool);
+        BufferSet::new(&self.ctx, capacity_bytes)
+    }
+
+    fn release(&self, set: BufferSet) {
+        // Cap the pool so we don't accumulate unbounded memory if many
+        // different chunk sizes have flowed through.
+        let mut pool = self.pool.lock().unwrap();
+        if pool.len() < 8 {
+            pool.push(set);
         }
     }
 
     /// Per-position LZ77. Same output shape as the brute-force pipeline.
+    /// Reuses GPU buffers across calls via the internal pool.
     pub fn match_find(&self, input: &[u8], window: u32) -> Vec<Token> {
         let n = input.len() as u32;
         if n == 0 {
             return Vec::new();
         }
 
-        let padded = input.len().next_multiple_of(4);
-        let mut input_padded = Vec::with_capacity(padded);
-        input_padded.extend_from_slice(input);
-        input_padded.resize(padded, 0);
-
-        let input_buffer = self
-            .ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("gpzip-lz77-hash-input"),
-                contents: &input_padded,
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-
-        // Hash table initialized to all 0xFF (= u32::MAX), so atomicMin
-        // accepts any first writer.
-        let hash_table_bytes = vec![0xffu8; HASH_SIZE * 4];
-        let hash_table = self
-            .ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("gpzip-lz77-hash-table"),
-                contents: &hash_table_bytes,
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-
+        let set = self.acquire(input.len());
         let token_bytes = (n as u64) * (std::mem::size_of::<Token>() as u64);
-        let tokens_buffer = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("gpzip-lz77-hash-tokens"),
-            size: token_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let staging_buffer = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("gpzip-lz77-hash-staging"),
-            size: token_bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
 
+        // Upload input — write_buffer reuses the buffer object. We pad to
+        // u32 because the WGSL side reads as `array<u32>`.
+        let padded = input.len().next_multiple_of(4);
+        let pad_extra = padded - input.len();
+        if pad_extra == 0 {
+            self.ctx.queue.write_buffer(&set.input, 0, input);
+        } else {
+            let mut buf = Vec::with_capacity(padded);
+            buf.extend_from_slice(input);
+            buf.resize(padded, 0);
+            self.ctx.queue.write_buffer(&set.input, 0, &buf);
+        }
+
+        // Update params (cheap, 32 bytes).
         let params = Params {
             input_len: n,
             hash_bits: HASH_BITS,
@@ -196,15 +269,13 @@ impl Lz77HashPipeline {
             chain_k: CHAIN_K,
             _pad: [0; 2],
         };
-        let params_buffer = self
-            .ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("gpzip-lz77-hash-params"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
+        self.ctx
+            .queue
+            .write_buffer(&set.params, 0, bytemuck::bytes_of(&params));
 
+        // Bind groups must be rebuilt because they reference buffer handles
+        // and we use a fresh BufferSet each call. Bind-group creation is
+        // cheap (~tens of µs) so this isn't worth pooling separately.
         let build_bg = self
             .ctx
             .device
@@ -214,15 +285,15 @@ impl Lz77HashPipeline {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: input_buffer.as_entire_binding(),
+                        resource: set.input.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: hash_table.as_entire_binding(),
+                        resource: set.hash_table.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: params_buffer.as_entire_binding(),
+                        resource: set.params.as_entire_binding(),
                     },
                 ],
             });
@@ -235,19 +306,19 @@ impl Lz77HashPipeline {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: input_buffer.as_entire_binding(),
+                        resource: set.input.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: hash_table.as_entire_binding(),
+                        resource: set.hash_table.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: tokens_buffer.as_entire_binding(),
+                        resource: set.tokens.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: params_buffer.as_entire_binding(),
+                        resource: set.params.as_entire_binding(),
                     },
                 ],
             });
@@ -258,6 +329,16 @@ impl Lz77HashPipeline {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("gpzip-lz77-hash-enc"),
             });
+
+        // Reset hash table to all-0xff via cheap GPU-side copy from the
+        // pre-staged blob. Avoids re-uploading 1 MiB of constant data.
+        encoder.copy_buffer_to_buffer(
+            &self.reset_blob,
+            0,
+            &set.hash_table,
+            0,
+            (HASH_SIZE * 4) as u64,
+        );
 
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -277,10 +358,10 @@ impl Lz77HashPipeline {
             pass.set_bind_group(0, &lookup_bg, &[]);
             pass.dispatch_workgroups(n.div_ceil(64), 1, 1);
         }
-        encoder.copy_buffer_to_buffer(&tokens_buffer, 0, &staging_buffer, 0, token_bytes);
+        encoder.copy_buffer_to_buffer(&set.tokens, 0, &set.staging, 0, token_bytes);
         self.ctx.queue.submit(std::iter::once(encoder.finish()));
 
-        let slice = staging_buffer.slice(..);
+        let slice = set.staging.slice(0..token_bytes);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
@@ -291,8 +372,9 @@ impl Lz77HashPipeline {
         let view = slice.get_mapped_range();
         let tokens: Vec<Token> = bytemuck::cast_slice::<u8, Token>(&view).to_vec();
         drop(view);
-        staging_buffer.unmap();
+        set.staging.unmap();
 
+        self.release(set);
         tokens
     }
 }
