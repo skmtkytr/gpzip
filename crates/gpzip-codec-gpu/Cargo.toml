@@ -17,15 +17,11 @@ enabled = [
     "dep:bytemuck",
     "dep:crc32fast",
     "dep:flate2",
+    "dep:gpzip-codec-cpu",
 ]
 
 [dependencies]
 gpzip-core = { path = "../gpzip-core" }
-# Always present so both the stub and the real backend can produce the
-# same `ChunkFn` type expected by downstream callers (gpzip-cli's hybrid
-# path). gpzip-codec-cpu carries no GPU deps, so this doesn't bloat the
-# wgpu-less build.
-gpzip-codec-cpu = { path = "../gpzip-codec-cpu" }
 thiserror.workspace = true
 tracing.workspace = true
 crossbeam-channel.workspace = true
@@ -36,6 +32,7 @@ pollster = { workspace = true, optional = true }
 bytemuck = { workspace = true, optional = true }
 crc32fast = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
+gpzip-codec-cpu = { path = "../gpzip-codec-cpu", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -148,16 +148,9 @@ plugs into the same API.
 ## Build
 
 ```sh
-cargo build --release                       # CPU-only, ~5 MiB binary
-cargo build --release --features gpu        # CPU + GPU, ~10 MiB (pulls wgpu)
+cargo build --release
 cargo test --workspace
 ```
-
-The default build is CPU-only because the GPU pipeline is currently
-slower and less effective than the CPU path on every measured workload
-(see status above). Pass `--features gpu` to build the wgpu-based
-backend; without it `--backend gpu` and `--backend auto` silently fall
-back to CPU.
 
 Output: `./target/release/gpzip`.
 
