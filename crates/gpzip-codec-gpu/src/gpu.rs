@@ -21,6 +21,7 @@ mod huffman_emit_v2;
 mod identity;
 mod lz77;
 mod lz77_hash;
+mod walk;
 
 pub use context::GpuContext;
 
