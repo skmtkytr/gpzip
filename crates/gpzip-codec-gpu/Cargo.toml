@@ -1,0 +1,28 @@
+[package]
+name = "gpzip-codec-gpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "wgpu-based GPU codec backend for gpzip (cross-vendor)"
+
+# Without `enabled`, the crate compiles to a stub with no wgpu dependency, so
+# the workspace builds on machines without a GPU runtime (CI, embedded).
+[features]
+default = []
+enabled = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "dep:crc32fast"]
+
+[dependencies]
+gpzip-core = { path = "../gpzip-core" }
+thiserror.workspace = true
+tracing.workspace = true
+
+# Optional, gated behind `enabled`
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
+crc32fast = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "gpzip-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core traits and archive I/O for gpzip"
+
+[dependencies]
+thiserror.workspace = true
+crossbeam-channel.workspace = true
+zip.workspace = true
+tar.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+gpzip-codec-cpu = { path = "../gpzip-codec-cpu" }

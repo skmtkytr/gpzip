@@ -1,0 +1,21 @@
+[package]
+name = "gpzip-codec-cpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CPU codec backend for gpzip"
+
+[dependencies]
+gpzip-core = { path = "../gpzip-core" }
+thiserror.workspace = true
+flate2.workspace = true
+zstd.workspace = true
+xz2.workspace = true
+bzip2.workspace = true
+unrar.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

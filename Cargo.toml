@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gpzip-core",
+    "crates/gpzip-codec-cpu",
+    "crates/gpzip-codec-gpu",
+    "crates/gpzip-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/skmtkytr/gpzip"
+
+[workspace.dependencies]
+# core
+thiserror = "2"
+anyhow = "1"
+bytes = "1"
+crossbeam-channel = "0.5"
+
+# archive / codec (CPU)
+zip = { version = "2", default-features = false, features = ["deflate", "deflate64", "zstd", "bzip2", "lzma", "time"] }
+tar = "0.4"
+flate2 = "1"
+zstd = "0.13"
+xz2 = "0.1"
+bzip2 = "0.4"
+unrar = "0.5"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.17"
+humansize = "2"
+
+# GPU
+wgpu = "0.19"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+crc32fast = "1"
+
+# logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# testing
+tempfile = "3"
+assert_fs = "1"
+predicates = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,34 @@
+[package]
+name = "gpzip-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI for gpzip"
+
+[[bin]]
+name = "gpzip"
+path = "src/main.rs"
+
+[features]
+default = ["cpu", "gpu"]
+cpu = []
+gpu = ["gpzip-codec-gpu/enabled"]
+
+[dependencies]
+gpzip-core = { path = "../gpzip-core" }
+gpzip-codec-cpu = { path = "../gpzip-codec-cpu" }
+gpzip-codec-gpu = { path = "../gpzip-codec-gpu" }
+clap.workspace = true
+indicatif.workspace = true
+humansize.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+crossbeam-channel.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+assert_fs.workspace = true
+predicates.workspace = true
