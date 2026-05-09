@@ -12,6 +12,7 @@ mod rar;
 mod sevenz;
 
 pub use backend::CpuBackend;
+pub use compress::{GzipCompressor, ZstdCompressor};
 pub use parallel::{ChunkFn, ParallelChunkedWriter};
 pub use rar::{extract_rar, list_rar};
 pub use sevenz::{extract_sevenz, list_sevenz};

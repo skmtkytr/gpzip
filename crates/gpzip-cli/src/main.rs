@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 mod app;
+mod hybrid;
 mod progress;
 
 fn main() -> Result<()> {

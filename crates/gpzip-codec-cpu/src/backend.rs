@@ -45,6 +45,14 @@ impl CpuBackend {
             max_in_flight,
         }
     }
+
+    pub fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight
+    }
 }
 
 impl CodecBackend for CpuBackend {

@@ -60,6 +60,28 @@ impl GpuBackend {
     pub fn context(&self) -> &GpuContext {
         &self.ctx
     }
+
+    pub fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight
+    }
+
+    /// Per-chunk gzip-member encoder backed by the GPU's hash-table LZ77
+    /// shader plus the host's dynamic-Huffman writer. Pulled out of
+    /// `wrap_writer` so the hybrid CPU+GPU writer in the CLI can compose
+    /// it with the CPU chunk_fn.
+    pub fn gzip_chunk_fn(&self) -> ChunkFn {
+        let lz77 = Arc::clone(&self.lz77);
+        Arc::new(move |bytes: &[u8]| -> std::io::Result<Vec<u8>> {
+            let raw = lz77.match_find(bytes, lz77_hash::DEFAULT_WINDOW);
+            let walked = lz77::greedy_walk(&raw, bytes);
+            let deflate = deflate::encode_block(&walked)?;
+            Ok(deflate::gzip_wrap(&deflate, bytes))
+        })
+    }
 }
 
 impl CodecBackend for GpuBackend {
@@ -108,20 +130,24 @@ impl Compressor for GpuGzipCompressor {
     }
 
     fn wrap_writer(self: Box<Self>, w: Box<dyn Write + Send>) -> Box<dyn Write + Send> {
-        let lz77 = Arc::clone(&self.lz77);
-        let chunk_fn: ChunkFn = Arc::new(move |bytes: &[u8]| -> std::io::Result<Vec<u8>> {
-            // GPU: per-position hash-table LZ77.
-            let raw = lz77.match_find(bytes, lz77_hash::DEFAULT_WINDOW);
-            // CPU: greedy + lazy selection, dynamic Huffman, gzip frame.
-            let walked = lz77::greedy_walk(&raw, bytes);
-            let deflate = deflate::encode_block(&walked)?;
-            Ok(deflate::gzip_wrap(&deflate, bytes))
-        });
+        let chunk_fn = self.chunk_fn_for_writer();
         Box::new(ParallelChunkedWriter::new(
             w,
             self.chunk_size,
             self.max_in_flight,
             chunk_fn,
         ))
+    }
+}
+
+impl GpuGzipCompressor {
+    fn chunk_fn_for_writer(&self) -> ChunkFn {
+        let lz77 = Arc::clone(&self.lz77);
+        Arc::new(move |bytes: &[u8]| -> std::io::Result<Vec<u8>> {
+            let raw = lz77.match_find(bytes, lz77_hash::DEFAULT_WINDOW);
+            let walked = lz77::greedy_walk(&raw, bytes);
+            let deflate = deflate::encode_block(&walked)?;
+            Ok(deflate::gzip_wrap(&deflate, bytes))
+        })
     }
 }

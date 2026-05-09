@@ -143,19 +143,27 @@ fn sink_for(quiet: bool, label: &str) -> (gpzip_core::ProgressSink, Option<Progr
 }
 
 fn build_registry(choice: BackendChoice, chunk_size: usize, threads: usize) -> BackendRegistry {
+    use crate::hybrid::HybridBackend;
+
     let mut r = BackendRegistry::new();
-    let cpu: Arc<dyn gpzip_core::CodecBackend> =
-        Arc::new(CpuBackend::with_config(chunk_size, threads));
+    let cpu = Arc::new(CpuBackend::with_config(chunk_size, threads));
+    let cpu_dyn: Arc<dyn gpzip_core::CodecBackend> = cpu.clone();
 
     match choice {
         BackendChoice::Cpu => {
-            r.push(cpu);
+            r.push(cpu_dyn);
         }
-        BackendChoice::Gpu | BackendChoice::Auto => {
+        BackendChoice::Gpu => {
             if let Ok(gpu) = GpuBackend::try_init() {
                 r.push(Arc::new(gpu));
             }
-            r.push(cpu);
+            r.push(cpu_dyn);
+        }
+        BackendChoice::Auto => {
+            // Hybrid: CPU and GPU race for chunks. Falls back to CPU-only
+            // when no GPU adapter is available.
+            let gpu = GpuBackend::try_init().ok().map(Arc::new);
+            r.push(Arc::new(HybridBackend::new(cpu, gpu)));
         }
     }
     r

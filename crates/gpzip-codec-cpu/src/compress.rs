@@ -46,22 +46,29 @@ impl GzipCompressor {
         }
     }
 }
+impl GzipCompressor {
+    /// Per-chunk gzip-member encoder. Pulled out of `wrap_writer` so the
+    /// hybrid CPU+GPU writer in the CLI can compose it with a GPU chunk_fn.
+    pub fn chunk_fn(level: Level) -> ChunkFn {
+        let lvl = level.clamp_to(0, 9) as u32;
+        Arc::new(move |bytes: &[u8]| {
+            let mut e = GzEncoder::new(Vec::with_capacity(bytes.len() / 2), Compression::new(lvl));
+            e.write_all(bytes)?;
+            e.finish()
+        })
+    }
+}
+
 impl Compressor for GzipCompressor {
     fn algorithm(&self) -> Algorithm {
         Algorithm::Gzip
     }
     fn wrap_writer(self: Box<Self>, w: Box<dyn Write + Send>) -> Box<dyn Write + Send> {
-        let lvl = self.level.clamp_to(0, 9) as u32;
-        let chunk_fn: ChunkFn = Arc::new(move |bytes: &[u8]| {
-            let mut e = GzEncoder::new(Vec::with_capacity(bytes.len() / 2), Compression::new(lvl));
-            e.write_all(bytes)?;
-            e.finish()
-        });
         Box::new(ParallelChunkedWriter::new(
             w,
             self.chunk_size,
             self.max_in_flight,
-            chunk_fn,
+            GzipCompressor::chunk_fn(self.level),
         ))
     }
 }
@@ -82,13 +89,11 @@ impl ZstdCompressor {
         }
     }
 }
-impl Compressor for ZstdCompressor {
-    fn algorithm(&self) -> Algorithm {
-        Algorithm::Zstd
-    }
-    fn wrap_writer(self: Box<Self>, w: Box<dyn Write + Send>) -> Box<dyn Write + Send> {
+impl ZstdCompressor {
+    /// Per-chunk zstd-frame encoder. Pulled out for hybrid composition.
+    pub fn chunk_fn(level: Level) -> ChunkFn {
         // Map our 0..=9 onto zstd's 1..=22 with sensible defaults.
-        let mapped: i32 = match self.level.0 {
+        let mapped: i32 = match level.0 {
             0 => 1,
             1..=4 => 2,
             5 => 3,
@@ -97,17 +102,25 @@ impl Compressor for ZstdCompressor {
             8 => 17,
             _ => 19,
         };
-        let chunk_fn: ChunkFn = Arc::new(move |bytes: &[u8]| {
+        Arc::new(move |bytes: &[u8]| {
             let mut e =
                 zstd::stream::write::Encoder::new(Vec::with_capacity(bytes.len() / 2), mapped)?;
             e.write_all(bytes)?;
             e.finish()
-        });
+        })
+    }
+}
+
+impl Compressor for ZstdCompressor {
+    fn algorithm(&self) -> Algorithm {
+        Algorithm::Zstd
+    }
+    fn wrap_writer(self: Box<Self>, w: Box<dyn Write + Send>) -> Box<dyn Write + Send> {
         Box::new(ParallelChunkedWriter::new(
             w,
             self.chunk_size,
             self.max_in_flight,
-            chunk_fn,
+            ZstdCompressor::chunk_fn(self.level),
         ))
     }
 }
