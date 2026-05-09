@@ -8,6 +8,10 @@ mod backend;
 mod compress;
 mod decompress;
 mod parallel;
+mod rar;
+mod sevenz;
 
 pub use backend::CpuBackend;
 pub use parallel::{ChunkFn, ParallelChunkedWriter};
+pub use rar::{extract_rar, list_rar};
+pub use sevenz::{extract_sevenz, list_sevenz};

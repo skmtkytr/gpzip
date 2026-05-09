@@ -29,6 +29,7 @@ zstd = "0.13"
 xz2 = "0.1"
 bzip2 = "0.4"
 unrar = "0.5"
+sevenz-rust2 = { version = "0.21", default-features = false, features = ["bzip2"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

@@ -98,14 +98,32 @@ pub fn run() -> Result<()> {
             output,
         } => {
             let (sink, prog) = sink_for(cli.quiet, "extracting");
-            let res = archive::unpack(&ar, &output, &registry, sink);
+            let res = match archive::detect_format(&ar) {
+                Some(archive::ArchiveFormat::Rar) => {
+                    gpzip_codec_cpu::extract_rar(&ar, &output, &sink).map_err(|e| anyhow!(e))
+                }
+                Some(archive::ArchiveFormat::SevenZ) => {
+                    gpzip_codec_cpu::extract_sevenz(&ar, &output, &sink).map_err(|e| anyhow!(e))
+                }
+                _ => archive::unpack(&ar, &output, &registry, sink.clone()).map_err(|e| anyhow!(e)),
+            };
+            // Make sure the sink is dropped before joining the progress thread.
+            drop(sink);
             if let Some(p) = prog {
                 p.finish();
             }
-            res.map_err(|e| anyhow!(e))?;
+            res?;
         }
         Command::L { archive: ar } => {
-            let entries = archive::list_archive(&ar, &registry).map_err(|e| anyhow!(e))?;
+            let entries = match archive::detect_format(&ar) {
+                Some(archive::ArchiveFormat::Rar) => {
+                    gpzip_codec_cpu::list_rar(&ar).map_err(|e| anyhow!(e))?
+                }
+                Some(archive::ArchiveFormat::SevenZ) => {
+                    gpzip_codec_cpu::list_sevenz(&ar).map_err(|e| anyhow!(e))?
+                }
+                _ => archive::list_archive(&ar, &registry).map_err(|e| anyhow!(e))?,
+            };
             for e in entries {
                 let kind = if e.is_dir { "d" } else { "-" };
                 println!("{kind} {:>12} {}", e.size, e.path.display());
