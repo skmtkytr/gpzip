@@ -845,6 +845,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "gpzip-codec-cpu",
+ "rayon",
  "tar",
  "tempfile",
  "thiserror 2.0.18",

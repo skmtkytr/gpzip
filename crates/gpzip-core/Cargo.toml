@@ -13,6 +13,7 @@ crossbeam-channel.workspace = true
 zip.workspace = true
 tar.workspace = true
 tracing.workspace = true
+rayon.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
