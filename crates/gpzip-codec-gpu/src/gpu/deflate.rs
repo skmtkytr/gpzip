@@ -1237,4 +1237,126 @@ mod tests {
             );
         }
     }
+
+    /// Per-stage profile for the production GPU chunk path:
+    /// `match_find` → `greedy_walk` → `encode_block_fast` → `gzip_wrap`.
+    /// Identifies which stage dominates wall time *now* (after #1 Huffman
+    /// rewrite, #2 segmented hash, #5 packed tokens) so the next
+    /// optimization target is chosen from data, not from the stale per-
+    /// stage numbers in the original review.
+    ///
+    /// Single-chunk path (no batching), 32 KiB chunks matching
+    /// `GpuBackend::chunk_size`. `#[ignore]` because it needs a GPU and
+    /// runs longer than a unit test. Invoke with:
+    ///
+    /// ```sh
+    /// cargo test --release -p gpzip-codec-gpu --features enabled \
+    ///     profile_pipeline_stages -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn profile_pipeline_stages() {
+        use crate::gpu::context::GpuContext;
+        use crate::gpu::lz77_hash::{Lz77HashPipeline, DEFAULT_WINDOW};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let Some(ctx) = GpuContext::try_init().ok() else {
+            eprintln!("no GPU — skipping profile");
+            return;
+        };
+        let pipeline = Lz77HashPipeline::new(Arc::new(ctx));
+
+        let chunk = 32 * 1024usize;
+        let workloads: Vec<(&str, Vec<u8>)> = vec![
+            ("rand", {
+                let mut v = Vec::with_capacity(chunk);
+                let mut x = 0xdeadbeefu32;
+                for _ in 0..chunk {
+                    x = x.wrapping_mul(2654435761).wrapping_add(1);
+                    v.push((x >> 8) as u8);
+                }
+                v
+            }),
+            ("rep", {
+                let pat = b"the quick brown fox jumps over the lazy dog 12345 ";
+                let mut v = Vec::with_capacity(chunk);
+                while v.len() < chunk {
+                    v.extend_from_slice(pat);
+                }
+                v.truncate(chunk);
+                v
+            }),
+            ("bin", {
+                let seed = std::fs::read("/usr/bin/bash").unwrap_or_else(|_| vec![0u8; 4096]);
+                let mut v = Vec::with_capacity(chunk);
+                while v.len() < chunk {
+                    v.extend_from_slice(&seed);
+                }
+                v.truncate(chunk);
+                v
+            }),
+        ];
+
+        eprintln!();
+        eprintln!(
+            "{:<6} {:>4}  {:>7} {:>7} {:>7} {:>7}  {:>7}   pct (gpu/walk/enc/wrap)",
+            "wkld", "iter", "gpu_ms", "walk_ms", "enc_ms", "wrap_ms", "tot_ms"
+        );
+        eprintln!("{}", "-".repeat(80));
+
+        for (name, data) in &workloads {
+            // Warm up.
+            for _ in 0..4 {
+                let raw = pipeline.match_find(data, DEFAULT_WINDOW);
+                let walked = greedy_walk(&raw, data);
+                let _ = encode_block_fast(&walked).unwrap();
+            }
+
+            let n = 64;
+            let mut t_gpu = 0.0f64;
+            let mut t_walk = 0.0f64;
+            let mut t_enc = 0.0f64;
+            let mut t_wrap = 0.0f64;
+
+            for _ in 0..n {
+                let s = Instant::now();
+                let raw = pipeline.match_find(data, DEFAULT_WINDOW);
+                t_gpu += s.elapsed().as_secs_f64();
+
+                let s = Instant::now();
+                let walked = greedy_walk(&raw, data);
+                t_walk += s.elapsed().as_secs_f64();
+
+                let s = Instant::now();
+                let deflate_bytes = encode_block_fast(&walked).unwrap();
+                t_enc += s.elapsed().as_secs_f64();
+
+                let s = Instant::now();
+                let _ = gzip_wrap(&deflate_bytes, data);
+                t_wrap += s.elapsed().as_secs_f64();
+            }
+
+            let k = n as f64;
+            let avg_gpu = t_gpu / k * 1e3;
+            let avg_walk = t_walk / k * 1e3;
+            let avg_enc = t_enc / k * 1e3;
+            let avg_wrap = t_wrap / k * 1e3;
+            let avg_total = avg_gpu + avg_walk + avg_enc + avg_wrap;
+            eprintln!(
+                "{:<6} {:>4}  {:>7.3} {:>7.3} {:>7.3} {:>7.3}  {:>7.3}   {:>3.0}/{:>2.0}/{:>2.0}/{:>2.0}",
+                name,
+                n,
+                avg_gpu,
+                avg_walk,
+                avg_enc,
+                avg_wrap,
+                avg_total,
+                avg_gpu / avg_total * 100.0,
+                avg_walk / avg_total * 100.0,
+                avg_enc / avg_total * 100.0,
+                avg_wrap / avg_total * 100.0,
+            );
+        }
+    }
 }
