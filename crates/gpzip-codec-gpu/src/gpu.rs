@@ -16,6 +16,7 @@ use gpzip_core::{
 mod chunk;
 mod context;
 mod identity;
+mod lz77;
 
 pub use context::GpuContext;
 
