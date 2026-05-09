@@ -24,7 +24,9 @@ crossbeam-channel = "0.5"
 # archive / codec (CPU)
 zip = { version = "2", default-features = false, features = ["deflate", "deflate64", "zstd", "bzip2", "lzma", "time"] }
 tar = "0.4"
-flate2 = "1"
+# zlib-rs backend: pure-Rust port of zlib-ng, ~2x faster than the
+# default miniz_oxide on compression. cozip uses the same.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 zstd = "0.13"
 xz2 = "0.1"
 bzip2 = "0.4"
