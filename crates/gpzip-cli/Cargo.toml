@@ -12,7 +12,13 @@ name = "gpzip"
 path = "src/main.rs"
 
 [features]
-default = ["cpu", "gpu"]
+# CPU-only by default. The GPU pipeline is research-track right now —
+# slower and less effective than the CPU path on every measured workload
+# (see README's bench table). Disabling it by default avoids pulling in
+# wgpu (~few MiB of binary, longer build, vulkan/metal/dx12 deps) for
+# users who only want the fast CPU codec. Build with `--features gpu`
+# to enable the GPU backend.
+default = ["cpu"]
 cpu = []
 gpu = ["gpzip-codec-gpu/enabled"]
 
