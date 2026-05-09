@@ -49,11 +49,19 @@ position. Closer matches than ideal would need a real hash chain
 package-merge length-limiting instead of frequency scaling — both are
 future work.
 
-Today's GPU path is correct everywhere (binary, text, random — all
-round-trip and pass `gzip -t`) but compression ratio is workload-dependent:
-near-CPU on binaries, much worse on highly repetitive input where every
-position eventually back-references the chunk start. CPU still wins on
-both speed and ratio for now.
+## Hybrid CPU + GPU
+
+`--backend auto` (the default) wires both devices into a single chunk
+queue: each chunk closure tries to acquire a GPU permit, falls through
+to the CPU encoder if the GPU is busy. Aggregate throughput is
+`cpu_speed + gpu_speed`, which is the only way the GPU path (slower per
+chunk than CPU today) can help end-to-end wall time.
+
+Today the math doesn't work — the GPU path is so much slower per chunk
+that the few chunks that land on it dominate the tail and hybrid loses
+to plain CPU. Pass `--backend cpu` for the fast path until the GPU
+shaders close the gap. The hybrid scaffolding stays so the speedup
+arrives automatically once the per-chunk gap shrinks.
 
 ## Flags
 
