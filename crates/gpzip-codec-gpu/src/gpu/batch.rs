@@ -28,7 +28,12 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use super::lz77::Token;
 use super::lz77_hash::{AsyncBatch, Lz77HashPipeline};
 
-const MAX_BATCH: usize = 8;
+// 16 was tried (was 8) — neutral on wall and aggregate throughput on a
+// 272 MB binmix profile (submit 1.30 → 1.28 ms/chunk, well within noise).
+// The GPU pipeline tops out around 8000 chunks/sec on the test box at any
+// MAX_BATCH ≥ 8 because batches don't actually fill to the cap when chunks
+// arrive at the rate they do — leaving headroom is harmless.
+const MAX_BATCH: usize = 16;
 /// In-flight batches between submitter and completer. Bounds GPU queue
 /// depth and host memory (each in-flight batch holds ~16 MiB of GPU
 /// buffers in the BufferSet pool). 4 is enough to keep the GPU busy

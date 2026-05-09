@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use gpzip_codec_cpu::CpuBackend;
-use gpzip_codec_gpu::{GpuBackend, LazyGpuBackend};
+use gpzip_codec_gpu::LazyGpuBackend;
 use gpzip_core::archive;
 use gpzip_core::BackendRegistry;
 
@@ -154,9 +154,12 @@ fn build_registry(choice: BackendChoice, chunk_size: usize, threads: usize) -> B
             r.push(cpu_dyn);
         }
         BackendChoice::Gpu => {
-            if let Ok(gpu) = GpuBackend::try_init() {
-                r.push(Arc::new(gpu));
-            }
+            // LazyGpuBackend implements CodecBackend itself, deferring wgpu
+            // init until the first compress call. The `x` (extract) and `l`
+            // (list) commands never reach that, so GPU init is skipped
+            // entirely for them. The fallback to CPU if no adapter is
+            // available stays in place via the second registry entry.
+            r.push(Arc::new(LazyGpuBackend::new()));
             r.push(cpu_dyn);
         }
         BackendChoice::Auto => {

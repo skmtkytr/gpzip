@@ -57,7 +57,19 @@ impl CodecBackend for HybridBackend {
                 // 2 permits keeps 80-90% of work on the better-compressing
                 // CPU path; the GPU mostly contributes during bursty
                 // periods when CPU permits are saturated.
-                gpu_workers: 2,
+                // 1 permit minimises the GPU's drag on hybrid output: real-
+                // workload measurements show the GPU path produces 4–15%
+                // worse compression than CPU, so every chunk that lands on
+                // the GPU costs ratio. 0 would skip GPU entirely and be
+                // fastest, but hybrid keeps a single permit so a future
+                // GPU improvement (or different hardware) lets the device
+                // start contributing without a CLI change. Real-world
+                // measurement showed gpu_workers ∈ {1,2,4,8} are all
+                // slower AND worse-compressing than --backend cpu on this
+                // box (Ryzen 7800X3D + RTX 4090) — see commit message for
+                // the table. --backend cpu is the recommended fast path
+                // until the GPU pipeline catches up.
+                gpu_workers: 1,
             })),
             // Zstd has no GPU implementation today; fall through to CPU.
             Algorithm::Zstd => Ok(Box::new(ZstdCompressor::new(
@@ -105,9 +117,12 @@ impl Compressor for HybridGzipCompressor {
         // exactly once on chunk N+1.
         const GPU_WARMUP_CHUNKS: usize = 4;
         let chunk_counter = Arc::new(AtomicUsize::new(0));
+        // Short-circuit when GPU is disabled (gpu_workers=0) so we never
+        // pay the wgpu init cost via get_or_init below.
+        let gpu_enabled = self.gpu_workers > 0;
         let composed: ChunkFn = Arc::new(move |bytes: &[u8]| {
             let n = chunk_counter.fetch_add(1, Ordering::Relaxed);
-            if n < GPU_WARMUP_CHUNKS {
+            if !gpu_enabled || n < GPU_WARMUP_CHUNKS {
                 return (cpu_fn)(bytes);
             }
             let gpu_fn = gpu_fn_cell.get_or_init(|| gpu.try_get().map(|g| g.gzip_chunk_fn()));

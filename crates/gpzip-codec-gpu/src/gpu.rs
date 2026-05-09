@@ -60,6 +60,38 @@ impl Default for LazyGpuBackend {
     }
 }
 
+/// Make LazyGpuBackend a drop-in for the registry. Capability is hardcoded
+/// (must be answered before init) and matches the inner GpuBackend's
+/// claims; compressor/decompressor calls trigger init via try_get and
+/// delegate. For paths that never compress (extract/list), GPU init
+/// never runs.
+impl CodecBackend for LazyGpuBackend {
+    fn name(&self) -> &'static str {
+        GpuBackend::NAME
+    }
+
+    fn supports(&self, algo: Algorithm) -> Capability {
+        match algo {
+            Algorithm::Gzip => Capability::CompressOnly,
+            _ => Capability::None,
+        }
+    }
+
+    fn compressor(&self, algo: Algorithm, level: Level) -> Result<Box<dyn Compressor>> {
+        match self.try_get() {
+            Some(gpu) => gpu.compressor(algo, level),
+            None => Err(Error::NoBackend { algo }),
+        }
+    }
+
+    fn decompressor(&self, algo: Algorithm) -> Result<Box<dyn Decompressor>> {
+        Err(Error::DecompressionUnsupported {
+            backend: GpuBackend::NAME,
+            algo,
+        })
+    }
+}
+
 /// GPU codec. Holds an initialized wgpu device + queue, a precompiled
 /// hash-table LZ77 pipeline, and a background batching worker. Cheap to
 /// clone (Arc'd internally).
@@ -106,11 +138,9 @@ impl GpuBackend {
             // walks up to 1024 entries it still couldn't recover.
             chunk_size: 32 * 1024,
             // 16: lets ParallelChunkedWriter dispatch enough chunks for
-            // BatchedLz77 to keep filling MAX_BATCH=8 batches back-to-back.
-            // Measured 5-trial averages on 64 MB workloads: 8→16 saved 6%
-            // wall on rand and 4% on bin; 32 and 64 plateaued (batches
-            // already saturated). The 8 baseline was leaving the worker
-            // briefly starved between batches.
+            // BatchedLz77 to keep filling batches back-to-back. Measured
+            // 5-trial averages on 64 MB workloads: 8→16 saved 6% wall on
+            // rand and 4% on bin; 32 and 64 plateaued.
             max_in_flight: 16,
         })
     }
