@@ -28,13 +28,26 @@
 
 #![allow(dead_code)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use super::context::GpuContext;
 use super::lz77::Token;
+
+/// Maximum token count the pool's buffers handle in one call. Chunks
+/// larger than this would need a fresh, bigger BufferSet (we'd panic
+/// before then because n_workgroups > WG_SIZE breaks the single-pass
+/// scan_totals; see assert in dispatch_emit). 32 KiB matches
+/// `GpuBackend::chunk_size`.
+const MAX_TOKENS: usize = 32 * 1024;
+/// Max output bytes for the worst case: ceil((header + N*32 + 16) / 8) + slack.
+/// Header is at most ~512 bytes for an extreme dynamic block; round generously.
+const MAX_OUTPUT_BYTES: usize = MAX_TOKENS * 4 + 1024;
+/// Max bytes for the host-built block header (dynamic Huffman headers
+/// max out around 300 bytes in practice; 1 KiB is safe slack).
+const MAX_HEADER_BYTES: usize = 1024;
 
 const SHADER: &str = include_str!("huffman_emit_v2.wgsl");
 const WG_SIZE: u32 = 256;
@@ -59,7 +72,9 @@ pub struct HuffmanEmitV2Pipeline {
     pipeline_scan: wgpu::ComputePipeline,
     pipeline_emit: wgpu::ComputePipeline,
     // Pre-uploaded fixed-Huffman LUT buffers — built once at pipeline
-    // creation and reused across every emit call.
+    // creation and reused across every emit call. The fixed-block path
+    // binds these directly; the dynamic-block path binds the per-call
+    // Huffman buffers from `EmitBufferSet` instead.
     buf_lit_lens: wgpu::Buffer,
     buf_lit_codes_pre: wgpu::Buffer,
     buf_dist_lens: wgpu::Buffer,
@@ -67,6 +82,44 @@ pub struct HuffmanEmitV2Pipeline {
     buf_len_lut: wgpu::Buffer,
     buf_dist_lut_lo: wgpu::Buffer,
     buf_dist_lut_hi: wgpu::Buffer,
+    /// Pool of variable-data buffers reused across calls. Each set is
+    /// sized for the maximum supported chunk (32 KiB tokens). D-1 / D-2
+    /// allocated these per call; under concurrent load the wgpu /
+    /// driver bookkeeping for ~10 buffer creations dominated short
+    /// dispatches, especially noticeable on the dynamic path which adds
+    /// 4 more per-call Huffman buffers.
+    pool: Mutex<Vec<EmitBufferSet>>,
+}
+
+/// One reusable bundle of GPU buffers for an emit call. All sized for
+/// the worst case (32 KiB chunk → 32 768 tokens). Smaller chunks just
+/// leave the buffer tails unused; the params + dispatch counts cap how
+/// far the shader reads / writes.
+struct EmitBufferSet {
+    /// Packed tokens (u32 each).
+    tokens: wgpu::Buffer,
+    /// Per-call Huffman tables (only written by the dynamic path).
+    /// Sized for 288 / 30 entries respectively.
+    lit_lens: wgpu::Buffer,
+    lit_codes_pre: wgpu::Buffer,
+    dist_lens: wgpu::Buffer,
+    dist_codes_pre: wgpu::Buffer,
+    /// Block header bytes the host pre-builds; copied into output.
+    header: wgpu::Buffer,
+    /// Per-token exclusive prefix offset within its workgroup
+    /// (output of pass 1).
+    per_token_offset: wgpu::Buffer,
+    /// Per-workgroup totals (output of pass 1, input of pass 2).
+    workgroup_totals: wgpu::Buffer,
+    /// Per-workgroup base offsets (exclusive prefix of totals,
+    /// output of pass 2).
+    workgroup_bases: wgpu::Buffer,
+    /// Atomic-OR target for the bitstream.
+    output: wgpu::Buffer,
+    /// MAP_READ buffer for `output` readback.
+    staging: wgpu::Buffer,
+    /// Uniform with n_tokens / n_workgroups / header_bit_count.
+    params: wgpu::Buffer,
 }
 
 impl HuffmanEmitV2Pipeline {
@@ -149,7 +202,38 @@ impl HuffmanEmitV2Pipeline {
             pipeline_compute,
             pipeline_scan,
             pipeline_emit,
+            pool: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Pop a buffer set from the pool, or build a fresh one if empty.
+    fn acquire(&self) -> EmitBufferSet {
+        if let Ok(mut p) = self.pool.lock() {
+            if let Some(s) = p.pop() {
+                return s;
+            }
+        }
+        EmitBufferSet::new(&self.ctx)
+    }
+
+    /// Return a buffer set to the pool. Capped at 8 sets so concurrent
+    /// dispatches don't pile up unbounded GPU memory.
+    fn release(&self, set: EmitBufferSet) {
+        if let Ok(mut p) = self.pool.lock() {
+            if p.len() < 8 {
+                p.push(set);
+            }
+        }
+    }
+
+    fn upload_u32(&self, label: &str, data: &[u32]) -> wgpu::Buffer {
+        self.ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(data),
+                usage: wgpu::BufferUsages::STORAGE,
+            })
     }
 
     /// Encode `tokens` as a fixed-Huffman DEFLATE block on the GPU,
@@ -171,10 +255,7 @@ impl HuffmanEmitV2Pipeline {
 
         self.dispatch_emit(
             tokens,
-            &self.buf_lit_lens,
-            &self.buf_lit_codes_pre,
-            &self.buf_dist_lens,
-            &self.buf_dist_codes_pre,
+            HuffmanSource::Static,
             &header_bytes,
             header_bit_count,
             total_bits,
@@ -197,47 +278,25 @@ impl HuffmanEmitV2Pipeline {
         }
         let dyn_h = build_dynamic_huffman(tokens)
             .ok_or_else(|| std::io::Error::other("dynamic Huffman build failed (tree too tall)"))?;
-
-        let buf_lit_lens = self.upload_u32("v3-lit-lens", &dyn_h.lit_lens_u32);
-        let buf_lit_codes_pre = self.upload_u32("v3-lit-codes-pre", &dyn_h.lit_codes_pre);
-        let buf_dist_lens = self.upload_u32("v3-dist-lens", &dyn_h.dist_lens_u32);
-        let buf_dist_codes_pre = self.upload_u32("v3-dist-codes-pre", &dyn_h.dist_codes_pre);
-
         let total_bits = dyn_h.header_bit_count as u64 + dyn_h.body_bit_count + dyn_h.eob_bits;
         Ok(self.dispatch_emit(
             tokens,
-            &buf_lit_lens,
-            &buf_lit_codes_pre,
-            &buf_dist_lens,
-            &buf_dist_codes_pre,
+            HuffmanSource::Dynamic(&dyn_h),
             &dyn_h.header_bytes,
             dyn_h.header_bit_count,
             total_bits,
         ))
     }
 
-    fn upload_u32(&self, label: &str, data: &[u32]) -> wgpu::Buffer {
-        self.ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytemuck::cast_slice(data),
-                usage: wgpu::BufferUsages::STORAGE,
-            })
-    }
-
     /// Shared 3-pass dispatch used by both fixed and dynamic emission.
-    /// Caller provides the four Huffman tables (already on-GPU), the
-    /// header byte stream + bit count, and the final total bit count
-    /// (used to trim the readback to the right byte length).
-    #[allow(clippy::too_many_arguments)]
+    /// Pulls a buffer set from the pool, writes the per-call data into
+    /// it, dispatches the three passes, reads back, returns the set to
+    /// the pool. Avoids the wgpu/driver overhead of creating ~10 fresh
+    /// buffers per call (the dominant cost on D-3 single-call benches).
     fn dispatch_emit(
         &self,
         tokens: &[Token],
-        buf_lit_lens: &wgpu::Buffer,
-        buf_lit_codes_pre: &wgpu::Buffer,
-        buf_dist_lens: &wgpu::Buffer,
-        buf_dist_codes_pre: &wgpu::Buffer,
+        huffman: HuffmanSource<'_>,
         header_bytes: &[u8],
         header_bit_count: u32,
         total_bits: u64,
@@ -254,80 +313,73 @@ impl HuffmanEmitV2Pipeline {
              n_tokens={n_tokens} requires {n_workgroups} (max {WG_SIZE})"
         );
 
-        // Output upper bound: header + n_tokens * 32 (worst-case match
-        // emission) + 16 (EOB up to 15 bits) + 1 spillover word.
-        let max_bits = (header_bit_count as u64) + (n_tokens as u64) * 32 + 16;
-        let max_words = (max_bits as usize).div_ceil(32) + 1;
-        let max_bytes = max_words * 4;
-
-        // Header buffer: pad to 4-byte multiple (wgpu copy alignment).
+        // Header padded to a 4-byte multiple (wgpu copy alignment).
         let mut header_padded = header_bytes.to_vec();
         while header_padded.len() % 4 != 0 {
             header_padded.push(0);
         }
 
-        let buf_tokens = self
-            .ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("v2-tokens"),
-                contents: bytemuck::cast_slice(&packed),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-        let buf_header = self
-            .ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("v2-header"),
-                contents: &header_padded,
-                usage: wgpu::BufferUsages::COPY_SRC,
-            });
-        let buf_per_token_offset = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("v2-per-token-offset"),
-            size: (n_tokens as u64) * 4,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        let buf_workgroup_totals = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("v2-workgroup-totals"),
-            size: (n_workgroups as u64) * 4,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        let buf_workgroup_bases = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("v2-workgroup-bases"),
-            size: (n_workgroups as u64) * 4,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        let buf_output = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("v2-output"),
-            size: max_bytes as u64,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let buf_staging = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("v2-staging"),
-            size: max_bytes as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        // Acquire a pooled buffer set; build a fresh one if the pool's
+        // empty.
+        let set = self.acquire();
+
+        // Per-call data: write into the pooled buffers via queue. wgpu
+        // schedules these to land before the encoder runs at submit time.
+        self.ctx
+            .queue
+            .write_buffer(&set.tokens, 0, bytemuck::cast_slice(&packed));
+        self.ctx.queue.write_buffer(&set.header, 0, &header_padded);
+
+        // Dynamic Huffman: write per-block code length / pre-reversed
+        // code arrays into the pooled buffers. Static path leaves them
+        // untouched (we'll bind the pipeline's pre-uploaded fixed LUTs
+        // in the bind group).
+        let (lit_lens_buf, lit_codes_pre_buf, dist_lens_buf, dist_codes_pre_buf) = match huffman {
+            HuffmanSource::Static => (
+                &self.buf_lit_lens,
+                &self.buf_lit_codes_pre,
+                &self.buf_dist_lens,
+                &self.buf_dist_codes_pre,
+            ),
+            HuffmanSource::Dynamic(h) => {
+                self.ctx.queue.write_buffer(
+                    &set.lit_lens,
+                    0,
+                    bytemuck::cast_slice(&h.lit_lens_u32),
+                );
+                self.ctx.queue.write_buffer(
+                    &set.lit_codes_pre,
+                    0,
+                    bytemuck::cast_slice(&h.lit_codes_pre),
+                );
+                self.ctx.queue.write_buffer(
+                    &set.dist_lens,
+                    0,
+                    bytemuck::cast_slice(&h.dist_lens_u32),
+                );
+                self.ctx.queue.write_buffer(
+                    &set.dist_codes_pre,
+                    0,
+                    bytemuck::cast_slice(&h.dist_codes_pre),
+                );
+                (
+                    &set.lit_lens,
+                    &set.lit_codes_pre,
+                    &set.dist_lens,
+                    &set.dist_codes_pre,
+                )
+            }
+        };
+
         let params = Params {
             n_tokens,
             n_workgroups,
             header_bit_count,
             _pad: 0,
         };
-        let buf_params = self
-            .ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("v2-params"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
+        self.ctx
+            .queue
+            .write_buffer(&set.params, 0, bytemuck::bytes_of(&params));
 
         let bind_group = self
             .ctx
@@ -336,21 +388,28 @@ impl HuffmanEmitV2Pipeline {
                 label: Some("v2-bg"),
                 layout: &self.bind_group_layout,
                 entries: &[
-                    bge(0, &buf_tokens),
-                    bge(1, buf_lit_lens),
-                    bge(2, buf_lit_codes_pre),
-                    bge(3, buf_dist_lens),
-                    bge(4, buf_dist_codes_pre),
+                    bge(0, &set.tokens),
+                    bge(1, lit_lens_buf),
+                    bge(2, lit_codes_pre_buf),
+                    bge(3, dist_lens_buf),
+                    bge(4, dist_codes_pre_buf),
                     bge(5, &self.buf_len_lut),
                     bge(6, &self.buf_dist_lut_lo),
                     bge(7, &self.buf_dist_lut_hi),
-                    bge(8, &buf_per_token_offset),
-                    bge(9, &buf_workgroup_totals),
-                    bge(10, &buf_workgroup_bases),
-                    bge(11, &buf_output),
-                    bge(12, &buf_params),
+                    bge(8, &set.per_token_offset),
+                    bge(9, &set.workgroup_totals),
+                    bge(10, &set.workgroup_bases),
+                    bge(11, &set.output),
+                    bge(12, &set.params),
                 ],
             });
+
+        // We only ever fill the first `live_bytes` of output / staging
+        // with meaningful data; clear/copy/copy-back at that size to
+        // skip touching the unused tail of the MAX_OUTPUT_BYTES buffer.
+        let live_bits = (header_bit_count as u64) + (n_tokens as u64) * 32 + 16;
+        let live_words = (live_bits as usize).div_ceil(32) + 1;
+        let live_bytes = (live_words * 4) as u64;
 
         let mut encoder = self
             .ctx
@@ -358,11 +417,10 @@ impl HuffmanEmitV2Pipeline {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("v2-enc"),
             });
-        // 1. Zero the output buffer (atomicOr later only sets bits).
-        encoder.clear_buffer(&buf_output, 0, None);
-        // 2. Copy the host-built block header into output[0..header_bytes].
-        //    The padding zeros at the tail are fine — they don't add any bits.
-        encoder.copy_buffer_to_buffer(&buf_header, 0, &buf_output, 0, header_padded.len() as u64);
+        // 1. Zero the live region of the output buffer.
+        encoder.clear_buffer(&set.output, 0, Some(live_bytes));
+        // 2. Copy the host-built block header into output[0..].
+        encoder.copy_buffer_to_buffer(&set.header, 0, &set.output, 0, header_padded.len() as u64);
         // 3. compute + local scan
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -393,10 +451,10 @@ impl HuffmanEmitV2Pipeline {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups((n_tokens + 1).div_ceil(WG_SIZE), 1, 1);
         }
-        encoder.copy_buffer_to_buffer(&buf_output, 0, &buf_staging, 0, max_bytes as u64);
+        encoder.copy_buffer_to_buffer(&set.output, 0, &set.staging, 0, live_bytes);
         self.ctx.queue.submit(std::iter::once(encoder.finish()));
 
-        let slice = buf_staging.slice(..);
+        let slice = set.staging.slice(0..live_bytes);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
@@ -404,12 +462,80 @@ impl HuffmanEmitV2Pipeline {
         self.ctx.device.poll(wgpu::Maintain::Wait);
         rx.recv().unwrap().expect("v2 buffer map failed");
         let view = slice.get_mapped_range();
-        let raw = view.to_vec();
-        drop(view);
-        buf_staging.unmap();
-
         let n_bytes = (total_bits as usize).div_ceil(8);
-        raw[..n_bytes].to_vec()
+        let out = view[..n_bytes].to_vec();
+        drop(view);
+        set.staging.unmap();
+
+        self.release(set);
+        out
+    }
+}
+
+/// Source of the four per-block Huffman lookup buffers (literal/length
+/// codes + lengths, distance codes + lengths). Fixed Huffman uses the
+/// pipeline's pre-uploaded buffers; dynamic computes them per block.
+enum HuffmanSource<'a> {
+    Static,
+    Dynamic(&'a DynamicHuffman),
+}
+
+impl EmitBufferSet {
+    fn new(ctx: &GpuContext) -> Self {
+        let mk = |label: &str, size: u64, usage: wgpu::BufferUsages| {
+            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        // STORAGE | COPY_DST so queue.write_buffer can populate them.
+        let storage_dst = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        Self {
+            tokens: mk("v2-pool-tokens", (MAX_TOKENS * 4) as u64, storage_dst),
+            lit_lens: mk("v2-pool-lit-lens", 288 * 4, storage_dst),
+            lit_codes_pre: mk("v2-pool-lit-codes-pre", 288 * 4, storage_dst),
+            dist_lens: mk("v2-pool-dist-lens", 32 * 4, storage_dst),
+            dist_codes_pre: mk("v2-pool-dist-codes-pre", 32 * 4, storage_dst),
+            header: mk(
+                "v2-pool-header",
+                MAX_HEADER_BYTES as u64,
+                wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            ),
+            per_token_offset: mk(
+                "v2-pool-per-token-offset",
+                (MAX_TOKENS * 4) as u64,
+                wgpu::BufferUsages::STORAGE,
+            ),
+            workgroup_totals: mk(
+                "v2-pool-workgroup-totals",
+                (WG_SIZE as u64) * 4,
+                wgpu::BufferUsages::STORAGE,
+            ),
+            workgroup_bases: mk(
+                "v2-pool-workgroup-bases",
+                (WG_SIZE as u64) * 4,
+                wgpu::BufferUsages::STORAGE,
+            ),
+            output: mk(
+                "v2-pool-output",
+                MAX_OUTPUT_BYTES as u64,
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            ),
+            staging: mk(
+                "v2-pool-staging",
+                MAX_OUTPUT_BYTES as u64,
+                wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            ),
+            params: mk(
+                "v2-pool-params",
+                std::mem::size_of::<Params>() as u64,
+                wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            ),
+        }
     }
 }
 
