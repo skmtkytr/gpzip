@@ -91,7 +91,7 @@ impl GpuBackend {
         Arc::new(move |bytes: &[u8]| -> std::io::Result<Vec<u8>> {
             let raw = batched.submit(bytes.to_vec());
             let walked = lz77::greedy_walk(&raw, bytes);
-            let deflate = deflate::encode_block(&walked)?;
+            let deflate = deflate::encode_block_fast(&walked)?;
             Ok(deflate::gzip_wrap(&deflate, bytes))
         })
     }
@@ -159,7 +159,7 @@ impl GpuGzipCompressor {
         Arc::new(move |bytes: &[u8]| -> std::io::Result<Vec<u8>> {
             let raw = batched.submit(bytes.to_vec());
             let walked = lz77::greedy_walk(&raw, bytes);
-            let deflate = deflate::encode_block(&walked)?;
+            let deflate = deflate::encode_block_fast(&walked)?;
             Ok(deflate::gzip_wrap(&deflate, bytes))
         })
     }
