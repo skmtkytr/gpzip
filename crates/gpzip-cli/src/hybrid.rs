@@ -15,23 +15,23 @@
 
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use gpzip_codec_cpu::{ChunkFn, CpuBackend, GzipCompressor, ParallelChunkedWriter, ZstdCompressor};
-use gpzip_codec_gpu::GpuBackend;
+use gpzip_codec_gpu::LazyGpuBackend;
 use gpzip_core::{
     Algorithm, Capability, CodecBackend, Compressor, Decompressor, Error, Level, Result,
 };
 
 pub struct HybridBackend {
     cpu: Arc<CpuBackend>,
-    gpu: Option<Arc<GpuBackend>>,
+    gpu: Arc<LazyGpuBackend>,
 }
 
 impl HybridBackend {
     pub const NAME: &'static str = "hybrid";
 
-    pub fn new(cpu: Arc<CpuBackend>, gpu: Option<Arc<GpuBackend>>) -> Self {
+    pub fn new(cpu: Arc<CpuBackend>, gpu: Arc<LazyGpuBackend>) -> Self {
         Self { cpu, gpu }
     }
 }
@@ -48,22 +48,19 @@ impl CodecBackend for HybridBackend {
     }
 
     fn compressor(&self, algo: Algorithm, level: Level) -> Result<Box<dyn Compressor>> {
-        match (algo, &self.gpu) {
-            (Algorithm::Gzip, Some(gpu)) => Ok(Box::new(HybridGzipCompressor {
+        match algo {
+            Algorithm::Gzip => Ok(Box::new(HybridGzipCompressor {
                 cpu_chunk_fn: GzipCompressor::chunk_fn(level),
-                gpu_chunk_fn: gpu.gzip_chunk_fn(),
+                gpu: Arc::clone(&self.gpu),
                 chunk_size: self.cpu.chunk_size(),
                 cpu_workers: self.cpu.max_in_flight(),
-                // Cap hybrid GPU permits independently of the GPU backend's
-                // internal max_in_flight (which is tuned for batching when
-                // GPU is the *only* path). The GPU's compression ratio is
-                // worse than the CPU's, so letting too many chunks land on
-                // GPU bloats the output. Keep it at 2 so 80-90% of work
-                // still goes to the better-compressing CPU path.
-                gpu_workers: 2.min(gpu.max_in_flight()),
+                // 2 permits keeps 80-90% of work on the better-compressing
+                // CPU path; the GPU mostly contributes during bursty
+                // periods when CPU permits are saturated.
+                gpu_workers: 2,
             })),
             // Zstd has no GPU implementation today; fall through to CPU.
-            (Algorithm::Zstd, _) => Ok(Box::new(ZstdCompressor::new(
+            Algorithm::Zstd => Ok(Box::new(ZstdCompressor::new(
                 level,
                 self.cpu.chunk_size(),
                 self.cpu.max_in_flight(),
@@ -80,7 +77,7 @@ impl CodecBackend for HybridBackend {
 
 struct HybridGzipCompressor {
     cpu_chunk_fn: ChunkFn,
-    gpu_chunk_fn: ChunkFn,
+    gpu: Arc<LazyGpuBackend>,
     chunk_size: usize,
     cpu_workers: usize,
     gpu_workers: usize,
@@ -94,14 +91,33 @@ impl Compressor for HybridGzipCompressor {
     fn wrap_writer(self: Box<Self>, w: Box<dyn Write + Send>) -> Box<dyn Write + Send> {
         let permits = Arc::new(AtomicUsize::new(self.gpu_workers));
         let cpu_fn = self.cpu_chunk_fn.clone();
-        let gpu_fn = self.gpu_chunk_fn.clone();
+        let gpu = Arc::clone(&self.gpu);
+        // Cache the materialised GPU chunk_fn after the first lookup; the
+        // OnceLock also serialises concurrent first-callers so wgpu init
+        // (~200 ms) runs exactly once. If init fails (no adapter), the cell
+        // holds None and every subsequent chunk falls through to the CPU
+        // path with no further retries.
+        let gpu_fn_cell: Arc<OnceLock<Option<ChunkFn>>> = Arc::new(OnceLock::new());
+        // Warm-up: skip GPU entirely for the first N chunks so small
+        // inputs (1-2 chunks) finish on CPU without ever paying the
+        // ~200 ms wgpu init cost. Default chunk_size is 2 MiB so N=4
+        // means inputs ≤ 8 MiB stay pure-CPU. Larger inputs pay init
+        // exactly once on chunk N+1.
+        const GPU_WARMUP_CHUNKS: usize = 4;
+        let chunk_counter = Arc::new(AtomicUsize::new(0));
         let composed: ChunkFn = Arc::new(move |bytes: &[u8]| {
-            if try_acquire(&permits) {
-                let result = (gpu_fn)(bytes);
-                permits.fetch_add(1, Ordering::Release);
-                result
-            } else {
-                (cpu_fn)(bytes)
+            let n = chunk_counter.fetch_add(1, Ordering::Relaxed);
+            if n < GPU_WARMUP_CHUNKS {
+                return (cpu_fn)(bytes);
+            }
+            let gpu_fn = gpu_fn_cell.get_or_init(|| gpu.try_get().map(|g| g.gzip_chunk_fn()));
+            match gpu_fn {
+                Some(f) if try_acquire(&permits) => {
+                    let result = f(bytes);
+                    permits.fetch_add(1, Ordering::Release);
+                    result
+                }
+                _ => (cpu_fn)(bytes),
             }
         });
         // Total in-flight = CPU workers + GPU permits, so neither device is

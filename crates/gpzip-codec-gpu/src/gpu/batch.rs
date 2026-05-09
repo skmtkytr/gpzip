@@ -6,10 +6,24 @@
 //! works on the previous batch get processed together. Cuts per-chunk
 //! submit + poll overhead down to per-batch.
 //!
-//! No timeout: when the queue has only one chunk, the worker processes it
-//! alone rather than waiting. That's the right call for low-throughput
-//! periods (don't add latency for nothing) and it's never *worse* than the
-//! non-batched path.
+//! ## Why one worker (not multiple)
+//!
+//! Profiling pointed at `device.poll(Maintain::Wait)` as ~18% of wall time
+//! and the obvious fix was N parallel workers each running their own
+//! submit→poll cycle. Measured at WORKERS=2 over 5 trials each, this
+//! actually *lost*: rand 391→428 ms (-9%), bin 411→481 ms (-17%), rep
+//! +4%. wgpu's `poll(Wait)` is a per-device wait, not per-submission, so
+//! two workers serialise inside wgpu's queue with extra Mutex contention
+//! on the BufferSet pool to boot. After the segmented hash + packed-token
+//! shrinks (#2 and #5), GPU compute per chunk is small enough that the
+//! true bottleneck moved to host-side encoding — multi-worker can't help.
+//! Kept the single-worker design; the negative result is documented here
+//! so a future contributor doesn't re-litigate it without new data.
+//!
+//! No batch timeout: when the queue has only one chunk, the worker
+//! processes it alone rather than waiting. That's the right call for
+//! low-throughput periods (don't add latency for nothing) and it's never
+//! *worse* than the non-batched path.
 
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};

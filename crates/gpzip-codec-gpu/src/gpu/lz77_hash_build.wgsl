@@ -1,13 +1,16 @@
-// Phase 1 of hash-chain LZ77 (replaces the previous K-way atomicMin bucket).
+// Phase 1 of segmented-hash LZ77.
 //
-// One head pointer per hash bucket + a `next` array sized to the input. Each
-// position p performs `atomicExchange(heads[h], p+1)` to install itself at
-// the chain head; the previous head value is recorded in `next[p]`. The
-// chain at any bucket is a linked list of all positions with that 3-byte
-// hash, ordered newest-first.
+// Each input position p writes (p+1) into seg_table[hash(p)][p >> seg_log2]
+// via atomicMin — keeps the OLDEST position per (hash, segment) bucket.
 //
-// p+1 is stored (not p) so head=0 means "empty bucket" and next[p]=0 means
-// "end of chain". This frees us from any sentinel like 0xffffffff.
+// Why segmentation: a parallel hash chain on GPU loses position ordering
+// (workgroups race at the head), so chain walks cant reliably find a
+// *close* prior position. Segmenting by `p >> seg_log2` gives every
+// position p a guaranteed candidate in each prior segment within window —
+// distance bounded by (segments_walked + 1) * seg_size. That's enough for
+// match-find quality even though we get only one candidate per segment.
+//
+// p+1 is stored (not p) so 0 (the reset value) reads as "unused".
 
 struct Params {
     input_len: u32,
@@ -15,13 +18,13 @@ struct Params {
     window: u32,
     min_match: u32,
     max_match: u32,
-    max_chain: u32,
+    seg_log2: u32,
+    num_segs: u32,
 }
 
-@group(0) @binding(0) var<storage, read>       input_buf:  array<u32>;
-@group(0) @binding(1) var<storage, read_write> heads:      array<atomic<u32>>;
-@group(0) @binding(2) var<storage, read_write> next_buf:   array<u32>;
-@group(0) @binding(3) var<uniform>             params:     Params;
+@group(0) @binding(0) var<storage, read>       input_buf: array<u32>;
+@group(0) @binding(1) var<storage, read_write> seg_table: array<atomic<u32>>;
+@group(0) @binding(2) var<uniform>             params:    Params;
 
 fn read_byte(idx: u32) -> u32 {
     let word  = input_buf[idx / 4u];
@@ -43,9 +46,7 @@ fn build(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = gid.x;
     if (p + 2u >= params.input_len) { return; }
     let h = hash3(p);
-    // Insert at head of chain. atomicExchange returns the previous head,
-    // which becomes our `next` pointer. Race-safe: each thread's swap is
-    // serialized at the head, and only this thread writes its own next[p].
-    let prev = atomicExchange(&heads[h], p + 1u);
-    next_buf[p] = prev;
+    let seg = p >> params.seg_log2;
+    // Store p+1 so the all-0xFF reset reads as "unused".
+    atomicMin(&seg_table[h * params.num_segs + seg], p + 1u);
 }

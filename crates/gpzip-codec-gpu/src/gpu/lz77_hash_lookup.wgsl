@@ -1,15 +1,12 @@
-// Phase 2 of hash-chain LZ77.
+// Phase 2 of segmented-hash LZ77.
 //
-// For each position p, walk the linked list at heads[hash(p)] following
-// `next_buf` pointers, ordered newest-first. The chain is monotone in
-// position (every link points to an earlier position), so once we walk past
-// the window boundary we can stop. We bound work with `max_chain` (zlib's
-// max_chain_length analogue) — past that, even a longer match isn't worth
-// the lookup cost.
+// For each position p, walk segments p_seg down to 0 (or until distance
+// exceeds window). Each segment provides one candidate (the OLDEST
+// position in that segment with the same 3-byte hash). Verify each, take
+// the longest match found.
 //
-// Match selection: keep the longest valid match seen across up to
-// max_chain candidates. Distance ties broken by closer-is-better (DEFLATE
-// shorter distance code = fewer bits).
+// Walking is bounded by window/seg_size segments at most — for the default
+// SEG_LOG2=12 (4 KiB) and window=32 KiB, that's 8 segments per lookup.
 
 struct Params {
     input_len: u32,
@@ -17,14 +14,18 @@ struct Params {
     window: u32,
     min_match: u32,
     max_match: u32,
-    max_chain: u32,
+    seg_log2: u32,
+    num_segs: u32,
 }
 
-@group(0) @binding(0) var<storage, read>       input_buf:  array<u32>;
-@group(0) @binding(1) var<storage, read>       heads:      array<u32>;
-@group(0) @binding(2) var<storage, read>       next_buf:   array<u32>;
-@group(0) @binding(3) var<storage, read_write> tokens:     array<vec2<u32>>;
-@group(0) @binding(4) var<uniform>             params:     Params;
+@group(0) @binding(0) var<storage, read>       input_buf: array<u32>;
+@group(0) @binding(1) var<storage, read>       seg_table: array<u32>;
+// Packed token: length in bits 16..31, distance/byte in bits 0..15.
+// Length max 258 fits in 9 bits; distance max 32768 fits in 15 bits;
+// literal byte fits in 8 bits — all comfortably inside one u16 each.
+// Halves the tokens buffer size (and PCIe readback) vs vec2<u32>.
+@group(0) @binding(2) var<storage, read_write> tokens:    array<u32>;
+@group(0) @binding(3) var<uniform>             params:    Params;
 
 fn read_byte(idx: u32) -> u32 {
     let word  = input_buf[idx / 4u];
@@ -47,39 +48,40 @@ fn lookup(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (p >= params.input_len) { return; }
 
     if (p + 2u >= params.input_len) {
-        tokens[p] = vec2<u32>(0u, read_byte(p));
+        tokens[p] = read_byte(p);
         return;
     }
 
     let h = hash3(p);
-    var cand_p1: u32 = heads[h];
-    var depth: u32 = 0u;
+    let p_seg = p >> params.seg_log2;
     var best_len: u32 = 0u;
     var best_dist: u32 = 0u;
 
+    // Walk current segment and earlier ones. p's own segment is included
+    // because the bucket may contain a same-segment position with smaller p.
+    var seg_offset: u32 = 0u;
     loop {
-        if (cand_p1 == 0u) { break; }
-        if (depth >= params.max_chain) { break; }
-
-        let cand = cand_p1 - 1u;
-        // Skip our own position and any "later" position (chain may briefly
-        // contain entries from concurrent threads with higher p).
+        if (seg_offset > p_seg) { break; }
+        let seg = p_seg - seg_offset;
+        let raw = seg_table[h * params.num_segs + seg];
+        if (raw == 0u || raw == 0xFFFFFFFFu) {
+            seg_offset = seg_offset + 1u;
+            continue;
+        }
+        let cand = raw - 1u;
+        // Same-segment bucket may hold a position > p (if a younger thread
+        // raced and lost the atomicMin to an even-younger one); skip those.
         if (cand >= p) {
-            cand_p1 = next_buf[cand];
-            depth = depth + 1u;
+            seg_offset = seg_offset + 1u;
             continue;
         }
         let dist = p - cand;
-        // Chain is monotone-decreasing in position once we pass our own p,
-        // so once we're outside the window we can stop walking entirely.
         if (dist > params.window) { break; }
 
-        // Hash collision check on first 3 bytes. Cheap, avoids the byte loop
-        // on collisions.
+        // Hash collision check on first 3 bytes.
         if (read_byte(cand) == read_byte(p)
             && read_byte(cand + 1u) == read_byte(p + 1u)
             && read_byte(cand + 2u) == read_byte(p + 2u)) {
-            // Extend match forward.
             var len: u32 = 3u;
             loop {
                 if (len >= params.max_match) { break; }
@@ -87,21 +89,17 @@ fn lookup(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if (read_byte(cand + len) != read_byte(p + len)) { break; }
                 len = len + 1u;
             }
-            // Keep longest. On ties, the chain order means we already have
-            // the closest (newest) one as best_dist.
             if (len > best_len) {
                 best_len = len;
                 best_dist = dist;
             }
         }
-
-        cand_p1 = next_buf[cand];
-        depth = depth + 1u;
+        seg_offset = seg_offset + 1u;
     }
 
     if (best_len == 0u) {
-        tokens[p] = vec2<u32>(0u, read_byte(p));
+        tokens[p] = read_byte(p);
     } else {
-        tokens[p] = vec2<u32>(best_len, best_dist);
+        tokens[p] = (best_len << 16u) | best_dist;
     }
 }

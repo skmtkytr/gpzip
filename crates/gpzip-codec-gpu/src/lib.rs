@@ -16,7 +16,10 @@ mod gpu;
 mod stub;
 
 #[cfg(feature = "enabled")]
-pub use gpu::GpuBackend;
+pub use gpu::{GpuBackend, LazyGpuBackend};
 
 #[cfg(not(feature = "enabled"))]
 pub use stub::StubBackend as GpuBackend;
+
+#[cfg(not(feature = "enabled"))]
+pub use stub::StubLazyBackend as LazyGpuBackend;

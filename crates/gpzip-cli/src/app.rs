@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use gpzip_codec_cpu::CpuBackend;
-use gpzip_codec_gpu::GpuBackend;
+use gpzip_codec_gpu::{GpuBackend, LazyGpuBackend};
 use gpzip_core::archive;
 use gpzip_core::BackendRegistry;
 
@@ -160,9 +160,13 @@ fn build_registry(choice: BackendChoice, chunk_size: usize, threads: usize) -> B
             r.push(cpu_dyn);
         }
         BackendChoice::Auto => {
-            // Hybrid: CPU and GPU race for chunks. Falls back to CPU-only
-            // when no GPU adapter is available.
-            let gpu = GpuBackend::try_init().ok().map(Arc::new);
+            // Hybrid: CPU and GPU race for chunks. GPU init is deferred to
+            // first chunk via LazyGpuBackend — small files (where the input
+            // finishes before any chunk would have reached the GPU permit)
+            // never pay the ~200 ms wgpu init cost. If no GPU adapter is
+            // available the lazy wrapper resolves to None on first probe
+            // and the hybrid path silently behaves like pure CPU.
+            let gpu = Arc::new(LazyGpuBackend::new());
             r.push(Arc::new(HybridBackend::new(cpu, gpu)));
         }
     }

@@ -14,6 +14,21 @@ impl StubBackend {
     }
 }
 
+/// Lazy stub: same shape as the real `LazyGpuBackend` so callers (the CLI's
+/// hybrid path) compile against the same API regardless of feature flag.
+/// `try_get` always returns `None` here.
+#[derive(Default)]
+pub struct StubLazyBackend;
+
+impl StubLazyBackend {
+    pub fn new() -> Self {
+        Self
+    }
+    pub fn try_get(&self) -> Option<&std::sync::Arc<StubBackend>> {
+        None
+    }
+}
+
 impl CodecBackend for StubBackend {
     fn name(&self) -> &'static str {
         Self::NAME

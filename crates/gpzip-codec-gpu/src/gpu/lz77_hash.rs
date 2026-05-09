@@ -1,27 +1,32 @@
-//! Hash-chain LZ77 on the GPU. Two-pass design:
+//! Segmented-hash LZ77 on the GPU. Two-pass design:
 //!
 //! 1. **Build pass** — each position p does
-//!    `prev = atomicExchange(&heads[hash(p)], p+1)` to install itself at the
-//!    chain head, then writes `next[p] = prev`. The chain at any bucket is
-//!    a singly-linked list of all positions sharing the 3-byte hash,
-//!    ordered newest-first.
+//!    `atomicMin(&seg_table[hash(p)][p >> seg_log2], p+1)`, keeping the
+//!    *oldest* position per (hash, segment) bucket.
 //!
-//! 2. **Lookup pass** — walk the chain at heads[hash(p)] following next[],
-//!    bounded by `max_chain` candidates. For each candidate verify the
-//!    3-byte hit and extend the match forward; keep the longest. The chain
-//!    is monotone in position (newer entries point at older ones), so once
-//!    we walk past `window` bytes we can stop early.
+//! 2. **Lookup pass** — walk segments from p's own segment back to 0 (or
+//!    until distance exceeds window). Each segment provides at most one
+//!    candidate; verify, extend, keep the longest match.
+//!
+//! ## Why segmentation
+//!
+//! Earlier attempts at a parallel hash chain (atomicExchange linked list)
+//! and a K-way atomicMin bucket both failed for repetitive data. The chain
+//! variant has no position ordering — workgroups race at the head, so the
+//! chain is dominated by whichever workgroup ran last; lookup walks find
+//! mostly "future" positions that get filtered out. The K-way bucket
+//! variant pinned each bucket to its oldest K occupants, leaving every
+//! later position outside the 32 KiB window.
+//!
+//! Segmenting by `p >> seg_log2` sidesteps both problems: every segment
+//! within window distance is guaranteed to have at most one candidate, and
+//! that candidate is bounded in distance by `(seg_offset + 1) * seg_size`.
+//! For SEG_LOG2=12 (4 KiB segments) and window=32 KiB, each lookup walks
+//! up to 8 segments, getting up to 8 candidates spread across the window.
 //!
 //! Output token format matches `lz77.rs`: one (length, distance) per input
 //! byte. The host's `greedy_walk` and the rest of the gzip pipeline are
 //! shared between brute-force and hash variants.
-//!
-//! This replaces an earlier K-way `atomicMin` bucket design that gave
-//! lock-free O(1) build but pinned each bucket to its oldest occupants —
-//! catastrophic for repetitive data because every later position would
-//! resolve to a distance > window and lose all matches. See the review
-//! notes for the measurement (rep workload ratio went from 0.547 to ~0.003
-//! with this change).
 
 use std::sync::{Arc, Mutex};
 
@@ -34,7 +39,7 @@ use super::lz77::Token;
 const BUILD_SHADER: &str = include_str!("lz77_hash_build.wgsl");
 const LOOKUP_SHADER: &str = include_str!("lz77_hash_lookup.wgsl");
 
-/// 2^HASH_BITS buckets. 16 → 64K buckets, heads buffer = 256 KiB.
+/// 2^HASH_BITS buckets. 16 → 64K buckets.
 pub const HASH_BITS: u32 = 16;
 const HASH_BUCKETS: usize = 1 << HASH_BITS;
 
@@ -42,14 +47,26 @@ pub const MIN_MATCH: u32 = 3;
 pub const MAX_MATCH: u32 = 258;
 pub const DEFAULT_WINDOW: u32 = 32 * 1024;
 
-/// Cap on chain walk in lookup. zlib uses 32 at level 5, 128 at level 7.
-/// Since GPU threads run thousands in parallel, a longer chain costs more
-/// per-thread but doesn't hurt occupancy. Set high (1024) because the GPU
-/// chain isn't ordered by position — workgroups race at the head, so the
-/// chain head is biased toward whichever workgroup ran last. To reach
-/// genuine prior-position candidates within a 512 KiB chunk, the walk
-/// often needs to traverse several hundred entries.
-pub const MAX_CHAIN: u32 = 1024;
+/// Unpack the GPU's packed-u32 token stream into the host-side `Token`
+/// struct. Encoded layout: `length << 16 | (distance | byte)`. For
+/// literals length=0 and the low 16 bits hold the byte value (0..255).
+#[inline]
+fn unpack_tokens(packed: &[u32]) -> Vec<Token> {
+    packed
+        .iter()
+        .map(|&w| Token {
+            length: w >> 16,
+            distance: w & 0xFFFF,
+        })
+        .collect()
+}
+
+/// log2 of segment size in bytes. 12 → 4 KiB segments. Smaller segments
+/// give finer-grained candidates (closer back-refs in expectation) at the
+/// cost of a larger seg_table. With window=32 KiB, lookup walks up to
+/// `window >> SEG_LOG2` = 8 segments.
+pub const SEG_LOG2: u32 = 12;
+const SEG_SIZE: usize = 1 << SEG_LOG2;
 
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
@@ -59,7 +76,9 @@ struct Params {
     window: u32,
     min_match: u32,
     max_match: u32,
-    max_chain: u32,
+    seg_log2: u32,
+    num_segs: u32,
+    _pad: u32,
 }
 
 pub struct Lz77HashPipeline {
@@ -81,12 +100,11 @@ pub struct Lz77HashPipeline {
 /// every chunk (was ~5-10 ms / chunk per profiling).
 struct BufferSet {
     input: wgpu::Buffer,
-    /// Chain heads, one u32 per hash bucket. Reset to zero between chunks.
-    heads: wgpu::Buffer,
-    /// next[p] = previous chain head when this position inserted itself.
-    /// One u32 per input byte; reads only happen at positions that were
-    /// written (no stale-data concern), so no reset between chunks.
-    next: wgpu::Buffer,
+    /// Per-(hash, segment) oldest position. Sized HASH_BUCKETS × num_segs
+    /// (where num_segs = ceil(capacity_bytes / SEG_SIZE)). Reset to all
+    /// 0xFF between chunks so the atomicMin write always replaces the
+    /// sentinel.
+    seg_table: wgpu::Buffer,
     tokens: wgpu::Buffer,
     staging: wgpu::Buffer,
     params: wgpu::Buffer,
@@ -99,26 +117,28 @@ struct BufferSet {
 impl BufferSet {
     fn new(ctx: &GpuContext, capacity_bytes: usize) -> Self {
         let padded = capacity_bytes.next_multiple_of(4);
+        let num_segs = capacity_bytes.div_ceil(SEG_SIZE).max(1);
+        let seg_table_bytes = HASH_BUCKETS * num_segs * 4;
+        // seg_table_bytes is consumed only by the create_buffer call below;
+        // the per-chunk reset size is recomputed in match_find* from the
+        // actual input length.
         let input = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gpzip-lz77-pool-input"),
             size: padded as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let heads = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("gpzip-lz77-pool-heads"),
-            size: (HASH_BUCKETS * 4) as u64,
+        let seg_table = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpzip-lz77-pool-seg-table"),
+            size: seg_table_bytes as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let next = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("gpzip-lz77-pool-next"),
-            // One u32 per input byte position.
-            size: (padded as u64) * 4,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        let token_bytes = (capacity_bytes as u64) * (std::mem::size_of::<Token>() as u64);
+        // Tokens are packed as one u32 per input position (length<<16 |
+        // distance/byte). Halves the buffer + readback bytes vs the older
+        // vec2<u32> layout — host-side `Token { length: u32, distance: u32 }`
+        // is reconstructed by `unpack_tokens` after readback.
+        let token_bytes = (capacity_bytes as u64) * (std::mem::size_of::<u32>() as u64);
         let tokens = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gpzip-lz77-pool-tokens"),
             size: token_bytes,
@@ -139,8 +159,7 @@ impl BufferSet {
         });
         Self {
             input,
-            heads,
-            next,
+            seg_table,
             tokens,
             staging,
             params,
@@ -164,7 +183,7 @@ impl Lz77HashPipeline {
                 source: wgpu::ShaderSource::Wgsl(LOOKUP_SHADER.into()),
             });
 
-        // Build: input(read) | heads(atomic rw) | next(rw, non-atomic) | params
+        // Build: input(read) | seg_table(atomic rw) | params
         let build_layout = ctx
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -172,11 +191,10 @@ impl Lz77HashPipeline {
                 entries: &[
                     storage_entry(0, true),
                     storage_entry(1, false),
-                    storage_entry(2, false),
-                    uniform_entry(3),
+                    uniform_entry(2),
                 ],
             });
-        // Lookup: input(read) | heads(read) | next(read) | tokens(rw) | params
+        // Lookup: input(read) | seg_table(read) | tokens(rw) | params
         let lookup_layout = ctx
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -184,9 +202,8 @@ impl Lz77HashPipeline {
                 entries: &[
                     storage_entry(0, true),
                     storage_entry(1, true),
-                    storage_entry(2, true),
-                    storage_entry(3, false),
-                    uniform_entry(4),
+                    storage_entry(2, false),
+                    uniform_entry(3),
                 ],
             });
 
@@ -222,14 +239,17 @@ impl Lz77HashPipeline {
                     entry_point: "lookup",
                 });
 
-        // Pre-stage one buffer of zeros for fast `heads` reset between
-        // chunks. `next` doesn't need reset (only positions that wrote
-        // their next[] entry will ever be read by the chain walk).
+        // Pre-stage all-0xFF for seg_table reset between chunks. Sized to
+        // cover seg_tables up to 512 KiB chunks (worst case 64K * 128 * 4
+        // = 32 MiB on GPU memory). RTX 4090 has 24 GiB so this is rounding
+        // error; smaller GPUs still have plenty of headroom and we never
+        // upload it from host after init.
+        const RESET_BLOB_BYTES: usize = HASH_BUCKETS * 128 * 4;
         let reset_blob = ctx
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("gpzip-lz77-hash-reset-blob"),
-                contents: &vec![0u8; HASH_BUCKETS * 4],
+                contents: &vec![0xffu8; RESET_BLOB_BYTES],
                 usage: wgpu::BufferUsages::COPY_SRC,
             });
 
@@ -276,7 +296,7 @@ impl Lz77HashPipeline {
         }
 
         let set = self.acquire(input.len());
-        let token_bytes = (n as u64) * (std::mem::size_of::<Token>() as u64);
+        let token_bytes = (n as u64) * (std::mem::size_of::<u32>() as u64);
 
         // Upload input — write_buffer reuses the buffer object. We pad to
         // u32 because the WGSL side reads as `array<u32>`.
@@ -291,14 +311,17 @@ impl Lz77HashPipeline {
             self.ctx.queue.write_buffer(&set.input, 0, &buf);
         }
 
-        // Update params (cheap, 24 bytes).
+        // Update params (cheap, 32 bytes).
+        let num_segs = (input.len().div_ceil(SEG_SIZE)).max(1) as u32;
         let params = Params {
             input_len: n,
             hash_bits: HASH_BITS,
             window,
             min_match: MIN_MATCH,
             max_match: MAX_MATCH,
-            max_chain: MAX_CHAIN,
+            seg_log2: SEG_LOG2,
+            num_segs,
+            _pad: 0,
         };
         self.ctx
             .queue
@@ -320,14 +343,10 @@ impl Lz77HashPipeline {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: set.heads.as_entire_binding(),
+                        resource: set.seg_table.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: set.next.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
                         resource: set.params.as_entire_binding(),
                     },
                 ],
@@ -345,18 +364,14 @@ impl Lz77HashPipeline {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: set.heads.as_entire_binding(),
+                        resource: set.seg_table.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: set.next.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
                         resource: set.tokens.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
-                        binding: 4,
+                        binding: 3,
                         resource: set.params.as_entire_binding(),
                     },
                 ],
@@ -369,14 +384,10 @@ impl Lz77HashPipeline {
                 label: Some("gpzip-lz77-hash-enc"),
             });
 
-        // Reset heads to zero via GPU-side copy. 256 KiB.
-        encoder.copy_buffer_to_buffer(
-            &self.reset_blob,
-            0,
-            &set.heads,
-            0,
-            (HASH_BUCKETS * 4) as u64,
-        );
+        // Reset seg_table to all-0xFF via GPU-side copy. Only reset the
+        // bytes used by THIS chunk's seg_table (smaller chunks need less).
+        let reset_bytes = (HASH_BUCKETS as u64) * (num_segs as u64) * 4;
+        encoder.copy_buffer_to_buffer(&self.reset_blob, 0, &set.seg_table, 0, reset_bytes);
 
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -408,7 +419,7 @@ impl Lz77HashPipeline {
         rx.recv().unwrap().expect("buffer map failed");
 
         let view = slice.get_mapped_range();
-        let tokens: Vec<Token> = bytemuck::cast_slice::<u8, Token>(&view).to_vec();
+        let tokens = unpack_tokens(bytemuck::cast_slice::<u8, u32>(&view));
         drop(view);
         set.staging.unmap();
 
@@ -452,13 +463,16 @@ impl Lz77HashPipeline {
                 self.ctx.queue.write_buffer(&set.input, 0, &buf);
             }
 
+            let num_segs = (input.len().div_ceil(SEG_SIZE)).max(1) as u32;
             let params = Params {
                 input_len: n,
                 hash_bits: HASH_BITS,
                 window,
                 min_match: MIN_MATCH,
                 max_match: MAX_MATCH,
-                max_chain: MAX_CHAIN,
+                seg_log2: SEG_LOG2,
+                num_segs,
+                _pad: 0,
             };
             self.ctx
                 .queue
@@ -477,14 +491,10 @@ impl Lz77HashPipeline {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 1,
-                                resource: set.heads.as_entire_binding(),
+                                resource: set.seg_table.as_entire_binding(),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 2,
-                                resource: set.next.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 3,
                                 resource: set.params.as_entire_binding(),
                             },
                         ],
@@ -503,24 +513,20 @@ impl Lz77HashPipeline {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 1,
-                                resource: set.heads.as_entire_binding(),
+                                resource: set.seg_table.as_entire_binding(),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 2,
-                                resource: set.next.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 3,
                                 resource: set.tokens.as_entire_binding(),
                             },
                             wgpu::BindGroupEntry {
-                                binding: 4,
+                                binding: 3,
                                 resource: set.params.as_entire_binding(),
                             },
                         ],
                     }),
             );
-            token_bytes_each.push((n as u64) * (std::mem::size_of::<Token>() as u64));
+            token_bytes_each.push((n as u64) * (std::mem::size_of::<u32>() as u64));
         }
 
         // One encoder for all chunks.
@@ -531,14 +537,11 @@ impl Lz77HashPipeline {
                 label: Some("gpzip-lz77-batch-enc"),
             });
         for (idx, set) in sets.iter().enumerate() {
-            let n = inputs[idx].len() as u32;
-            encoder.copy_buffer_to_buffer(
-                &self.reset_blob,
-                0,
-                &set.heads,
-                0,
-                (HASH_BUCKETS * 4) as u64,
-            );
+            let input_bytes = inputs[idx].len();
+            let n = input_bytes as u32;
+            let num_segs = input_bytes.div_ceil(SEG_SIZE).max(1) as u64;
+            let reset_bytes = (HASH_BUCKETS as u64) * num_segs * 4;
+            encoder.copy_buffer_to_buffer(&self.reset_blob, 0, &set.seg_table, 0, reset_bytes);
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("gpzip-lz77-batch-build-pass"),
@@ -581,7 +584,7 @@ impl Lz77HashPipeline {
         for ((set, &nbytes), rx) in sets.iter().zip(&token_bytes_each).zip(receivers) {
             rx.recv().unwrap().expect("buffer map failed");
             let view = set.staging.slice(0..nbytes).get_mapped_range();
-            let tokens: Vec<Token> = bytemuck::cast_slice::<u8, Token>(&view).to_vec();
+            let tokens = unpack_tokens(bytemuck::cast_slice::<u8, u32>(&view));
             drop(view);
             set.staging.unmap();
             out.push(tokens);
