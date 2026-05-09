@@ -734,32 +734,65 @@ fn total_bits_for_fixed(tokens: &[Token]) -> u64 {
     bits + eob_bits as u64
 }
 
+/// Host-side O(1) lookup for length/distance code metadata. The data
+/// is the same as the GPU-side `len_lut()` / `dist_lut_lo()` /
+/// `dist_lut_hi()` (packed `(sym - 257) | (extra << 8) | (base << 16)`
+/// for length, `sym | (extra << 8) | (base << 16)` for distance), built
+/// once on first call and cached. Replaces the original 29-row linear
+/// scans which were called O(n_tokens) times per dynamic encode block.
+fn host_len_lut() -> &'static [u32; 259] {
+    use std::sync::OnceLock;
+    static LUT: OnceLock<[u32; 259]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let v = build_len_lut();
+        let mut a = [0u32; 259];
+        a[..v.len()].copy_from_slice(&v);
+        a
+    })
+}
+
+fn host_dist_lut_lo() -> &'static [u32; 257] {
+    use std::sync::OnceLock;
+    static LUT: OnceLock<[u32; 257]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let v = build_dist_lut_lo();
+        let mut a = [0u32; 257];
+        a[..v.len()].copy_from_slice(&v);
+        a
+    })
+}
+
+fn host_dist_lut_hi() -> &'static [u32; 256] {
+    use std::sync::OnceLock;
+    static LUT: OnceLock<[u32; 256]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let v = build_dist_lut_hi();
+        let mut a = [0u32; 256];
+        a[..v.len()].copy_from_slice(&v);
+        a
+    })
+}
+
 fn host_length_code(length: u32) -> (u32, u32, u32) {
     debug_assert!((3..=258).contains(&length));
-    let mut idx = 0;
-    for (i, row) in LEN_ROWS.iter().enumerate() {
-        if row.0 <= length {
-            idx = i;
-        } else {
-            break;
-        }
-    }
-    let (base, extra, code) = LEN_ROWS[idx];
-    (code, extra, length - base)
+    let packed = host_len_lut()[length as usize];
+    let sym = (packed & 0xFF) + 257;
+    let extra = (packed >> 8) & 0xFF;
+    let base = (packed >> 16) & 0xFFFF;
+    (sym, extra, length - base)
 }
 
 fn host_distance_code(distance: u32) -> (u32, u32, u32) {
     debug_assert!((1..=32768).contains(&distance));
-    let mut idx = 0;
-    for (i, row) in DIST_ROWS.iter().enumerate() {
-        if row.0 <= distance {
-            idx = i;
-        } else {
-            break;
-        }
-    }
-    let (base, extra, code) = DIST_ROWS[idx];
-    (code, extra, distance - base)
+    let packed = if distance <= 256 {
+        host_dist_lut_lo()[distance as usize]
+    } else {
+        host_dist_lut_hi()[((distance - 1) >> 7) as usize]
+    };
+    let sym = packed & 0xFF;
+    let extra = (packed >> 8) & 0xFF;
+    let base = (packed >> 16) & 0xFFFF;
+    (sym, extra, distance - base)
 }
 
 const LEN_ROWS: &[(u32, u32, u32)] = &[
