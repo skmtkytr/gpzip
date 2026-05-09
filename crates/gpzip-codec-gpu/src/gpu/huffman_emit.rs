@@ -517,4 +517,134 @@ mod tests {
             .expect("empty fixed block should decode");
         assert!(decoded.is_empty());
     }
+
+    /// A/B benchmark: GPU emit (D-1) vs host fixed-Huffman writer vs
+    /// host dynamic-Huffman writer (the production encoder). Uses real
+    /// LZ77 token streams from the GPU match finder so the comparison
+    /// reflects realistic per-chunk work, not synthetic literals.
+    ///
+    /// `#[ignore]` because it needs a GPU and runs longer than a unit
+    /// test. Invoke with:
+    ///
+    /// ```sh
+    /// cargo test --release -p gpzip-codec-gpu --features enabled \
+    ///     bench_emit_vs_host -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn bench_emit_vs_host() {
+        use crate::gpu::context::GpuContext;
+        use crate::gpu::deflate::{encode_block_fast, encode_fixed_block};
+        use crate::gpu::lz77::greedy_walk;
+        use crate::gpu::lz77_hash::{Lz77HashPipeline, DEFAULT_WINDOW};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let Some(ctx) = GpuContext::try_init().ok() else {
+            eprintln!("no GPU — skipping bench");
+            return;
+        };
+        let ctx = Arc::new(ctx);
+        let lz77 = Lz77HashPipeline::new(Arc::clone(&ctx));
+        let emit = HuffmanEmitPipeline::new(Arc::clone(&ctx));
+
+        let chunk = 32 * 1024usize;
+        let workloads: Vec<(&str, Vec<u8>)> = vec![
+            ("rand", {
+                let mut v = Vec::with_capacity(chunk);
+                let mut x = 0xdeadbeefu32;
+                for _ in 0..chunk {
+                    x = x.wrapping_mul(2654435761).wrapping_add(1);
+                    v.push((x >> 8) as u8);
+                }
+                v
+            }),
+            ("rep", {
+                let pat = b"the quick brown fox jumps over the lazy dog 12345 ";
+                let mut v = Vec::with_capacity(chunk);
+                while v.len() < chunk {
+                    v.extend_from_slice(pat);
+                }
+                v.truncate(chunk);
+                v
+            }),
+            ("bin", {
+                let seed = std::fs::read("/usr/bin/bash").unwrap_or_else(|_| vec![0u8; 4096]);
+                let mut v = Vec::with_capacity(chunk);
+                while v.len() < chunk {
+                    v.extend_from_slice(&seed);
+                }
+                v.truncate(chunk);
+                v
+            }),
+        ];
+
+        eprintln!();
+        eprintln!(
+            "{:<6} {:>7}  {:>10} {:>10} {:>10}  {:>9} {:>9} {:>9}",
+            "wkld", "tokens", "host_dyn", "host_fix", "gpu_d1", "dyn_KiB", "fix_KiB", "d1_KiB"
+        );
+        eprintln!("{}", "-".repeat(85));
+
+        for (name, data) in &workloads {
+            let raw = lz77.match_find(data, DEFAULT_WINDOW);
+            let walked = greedy_walk(&raw, data);
+            let n_tokens = walked.len();
+
+            // Warm both encoders.
+            for _ in 0..2 {
+                let _ = encode_block_fast(&walked).unwrap();
+                let _ = encode_fixed_block(&walked).unwrap();
+                let _ = emit.emit_fixed_block(&walked);
+            }
+
+            let iters = 32;
+
+            let t = Instant::now();
+            let mut dyn_out = Vec::new();
+            for _ in 0..iters {
+                dyn_out = encode_block_fast(&walked).unwrap();
+            }
+            let dyn_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+
+            let t = Instant::now();
+            let mut fix_out = Vec::new();
+            for _ in 0..iters {
+                fix_out = encode_fixed_block(&walked).unwrap();
+            }
+            let fix_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+
+            let t = Instant::now();
+            let mut d1_out = Vec::new();
+            for _ in 0..iters {
+                d1_out = emit.emit_fixed_block(&walked);
+            }
+            let d1_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+
+            // Sanity: D-1 output should match host fixed-block byte-for-byte.
+            assert_eq!(
+                d1_out, fix_out,
+                "{name}: GPU D-1 must produce identical bytes to host encode_fixed_block"
+            );
+
+            eprintln!(
+                "{:<6} {:>7}  {:>9.3}ms {:>9.3}ms {:>9.3}ms  {:>9} {:>9} {:>9}",
+                name,
+                n_tokens,
+                dyn_ms,
+                fix_ms,
+                d1_ms,
+                dyn_out.len(),
+                fix_out.len(),
+                d1_out.len()
+            );
+        }
+
+        eprintln!();
+        eprintln!("Notes:");
+        eprintln!("  host_dyn = encode_block_fast (production, dynamic Huffman)");
+        eprintln!("  host_fix = encode_fixed_block (host, fixed Huffman, A/B baseline for D-1)");
+        eprintln!("  gpu_d1   = emit_fixed_block (GPU shader, fixed Huffman)");
+        eprintln!("  Output sizes should be: fix == d1 (bit-identical), dyn typically smaller.");
+    }
 }
