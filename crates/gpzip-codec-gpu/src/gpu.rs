@@ -105,11 +105,13 @@ impl GpuBackend {
             // compression ratio on repetitive data — measured with chain
             // walks up to 1024 entries it still couldn't recover.
             chunk_size: 32 * 1024,
-            // Bumped from 2 → 8 so the batching worker can actually fill
-            // batches when the hybrid pipeline is firing many chunks at
-            // once. The MAX_BATCH inside BatchedLz77 caps actual batch
-            // size at the same number.
-            max_in_flight: 8,
+            // 16: lets ParallelChunkedWriter dispatch enough chunks for
+            // BatchedLz77 to keep filling MAX_BATCH=8 batches back-to-back.
+            // Measured 5-trial averages on 64 MB workloads: 8→16 saved 6%
+            // wall on rand and 4% on bin; 32 and 64 plateaued (batches
+            // already saturated). The 8 baseline was leaving the worker
+            // briefly starved between batches.
+            max_in_flight: 16,
         })
     }
 

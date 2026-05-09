@@ -104,7 +104,8 @@ struct BufferSet {
     /// (where num_segs = ceil(capacity_bytes / SEG_SIZE)). Reset to all
     /// 0xFF between chunks so the atomicMin write always replaces the
     /// sentinel.
-    seg_table: wgpu::Buffer,
+    seg_oldest: wgpu::Buffer,
+    seg_newest: wgpu::Buffer,
     tokens: wgpu::Buffer,
     staging: wgpu::Buffer,
     params: wgpu::Buffer,
@@ -128,9 +129,19 @@ impl BufferSet {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let seg_table = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("gpzip-lz77-pool-seg-table"),
+        // Two seg tables: atomicMin keeps the OLDEST p per (hash, seg)
+        // bucket; atomicMax keeps the NEWEST. Lookup tries both to get a
+        // closer-distance candidate (better Huffman code) when available.
+        let seg_oldest = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpzip-lz77-pool-seg-oldest"),
             size: seg_table_bytes as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let seg_newest = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpzip-lz77-pool-seg-newest"),
+            size: seg_table_bytes as u64,
+            // COPY_DST needed for clear_buffer (zero fill).
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -159,7 +170,8 @@ impl BufferSet {
         });
         Self {
             input,
-            seg_table,
+            seg_oldest,
+            seg_newest,
             tokens,
             staging,
             params,
@@ -183,7 +195,7 @@ impl Lz77HashPipeline {
                 source: wgpu::ShaderSource::Wgsl(LOOKUP_SHADER.into()),
             });
 
-        // Build: input(read) | seg_table(atomic rw) | params
+        // Build: input(read) | seg_oldest(atomic rw) | seg_newest(atomic rw) | params
         let build_layout = ctx
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -191,10 +203,11 @@ impl Lz77HashPipeline {
                 entries: &[
                     storage_entry(0, true),
                     storage_entry(1, false),
-                    uniform_entry(2),
+                    storage_entry(2, false),
+                    uniform_entry(3),
                 ],
             });
-        // Lookup: input(read) | seg_table(read) | tokens(rw) | params
+        // Lookup: input(read) | seg_oldest(read) | seg_newest(read) | tokens(rw) | params
         let lookup_layout = ctx
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -202,8 +215,9 @@ impl Lz77HashPipeline {
                 entries: &[
                     storage_entry(0, true),
                     storage_entry(1, true),
-                    storage_entry(2, false),
-                    uniform_entry(3),
+                    storage_entry(2, true),
+                    storage_entry(3, false),
+                    uniform_entry(4),
                 ],
             });
 
@@ -343,10 +357,14 @@ impl Lz77HashPipeline {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: set.seg_table.as_entire_binding(),
+                        resource: set.seg_oldest.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
+                        resource: set.seg_newest.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
                         resource: set.params.as_entire_binding(),
                     },
                 ],
@@ -364,14 +382,18 @@ impl Lz77HashPipeline {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: set.seg_table.as_entire_binding(),
+                        resource: set.seg_oldest.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: set.tokens.as_entire_binding(),
+                        resource: set.seg_newest.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
+                        resource: set.tokens.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
                         resource: set.params.as_entire_binding(),
                     },
                 ],
@@ -384,10 +406,13 @@ impl Lz77HashPipeline {
                 label: Some("gpzip-lz77-hash-enc"),
             });
 
-        // Reset seg_table to all-0xFF via GPU-side copy. Only reset the
-        // bytes used by THIS chunk's seg_table (smaller chunks need less).
+        // Reset both seg tables. seg_oldest needs all-0xFF (atomicMin
+        // sentinel); seg_newest needs all-0x00 (atomicMax sentinel).
+        // Only reset the bytes used by THIS chunk's table (smaller chunks
+        // need less).
         let reset_bytes = (HASH_BUCKETS as u64) * (num_segs as u64) * 4;
-        encoder.copy_buffer_to_buffer(&self.reset_blob, 0, &set.seg_table, 0, reset_bytes);
+        encoder.copy_buffer_to_buffer(&self.reset_blob, 0, &set.seg_oldest, 0, reset_bytes);
+        encoder.clear_buffer(&set.seg_newest, 0, Some(reset_bytes));
 
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -427,16 +452,25 @@ impl Lz77HashPipeline {
         tokens
     }
 
-    /// Process several chunks in a single command-buffer submission. Acquires
-    /// one BufferSet per input, builds all the hash-reset, build, lookup, and
-    /// copy commands into one encoder, submits once, polls once, then maps
-    /// every staging buffer in turn. Cuts the per-chunk submit + poll cost
-    /// down to per-batch.
+    /// Synchronous wrapper around `submit_batch_async` + `collect_async`.
+    /// Kept for direct callers (tests) that don't pipeline; the production
+    /// path through `BatchedLz77` uses the async pair so submission of
+    /// batch N+1 can overlap with read-back of batch N (`WaitForSubmissionIndex`
+    /// is per-submission, so the GPU queue can deepen beyond one batch).
+    #[allow(dead_code)]
     pub fn match_find_batch(&self, inputs: &[&[u8]], window: u32) -> Vec<Vec<Token>> {
         if inputs.is_empty() {
             return Vec::new();
         }
+        let async_batch = self.submit_batch_async(inputs, window);
+        self.collect_async(async_batch)
+    }
 
+    /// Submit a batch to the GPU and return a handle the caller can hand
+    /// to `collect_async` later. Doesn't block on completion — the only
+    /// host work is the input upload + encoder build + submit, all
+    /// synchronous but fast (~50–100 µs per batch in profile).
+    pub fn submit_batch_async(&self, inputs: &[&[u8]], window: u32) -> AsyncBatch {
         // Acquire all buffer sets up front so the encoder can reference them.
         let sets: Vec<BufferSet> = inputs
             .iter()
@@ -491,10 +525,14 @@ impl Lz77HashPipeline {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 1,
-                                resource: set.seg_table.as_entire_binding(),
+                                resource: set.seg_oldest.as_entire_binding(),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 2,
+                                resource: set.seg_newest.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
                                 resource: set.params.as_entire_binding(),
                             },
                         ],
@@ -513,14 +551,18 @@ impl Lz77HashPipeline {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 1,
-                                resource: set.seg_table.as_entire_binding(),
+                                resource: set.seg_oldest.as_entire_binding(),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 2,
-                                resource: set.tokens.as_entire_binding(),
+                                resource: set.seg_newest.as_entire_binding(),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 3,
+                                resource: set.tokens.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
                                 resource: set.params.as_entire_binding(),
                             },
                         ],
@@ -541,7 +583,8 @@ impl Lz77HashPipeline {
             let n = input_bytes as u32;
             let num_segs = input_bytes.div_ceil(SEG_SIZE).max(1) as u64;
             let reset_bytes = (HASH_BUCKETS as u64) * num_segs * 4;
-            encoder.copy_buffer_to_buffer(&self.reset_blob, 0, &set.seg_table, 0, reset_bytes);
+            encoder.copy_buffer_to_buffer(&self.reset_blob, 0, &set.seg_oldest, 0, reset_bytes);
+            encoder.clear_buffer(&set.seg_newest, 0, Some(reset_bytes));
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("gpzip-lz77-batch-build-pass"),
@@ -562,10 +605,10 @@ impl Lz77HashPipeline {
             }
             encoder.copy_buffer_to_buffer(&set.tokens, 0, &set.staging, 0, token_bytes_each[idx]);
         }
-        self.ctx.queue.submit(std::iter::once(encoder.finish()));
+        let submission_index = self.ctx.queue.submit(std::iter::once(encoder.finish()));
 
-        // Map every staging buffer; a single device.poll(Wait) covers all of
-        // them because Wait blocks until *all* pending submissions complete.
+        // Register map_async on every staging buffer; callbacks fire when
+        // the corresponding poll() processes them in `collect_async`.
         let receivers: Vec<_> = sets
             .iter()
             .zip(&token_bytes_each)
@@ -578,10 +621,34 @@ impl Lz77HashPipeline {
                 rx
             })
             .collect();
-        self.ctx.device.poll(wgpu::Maintain::Wait);
 
-        let mut out = Vec::with_capacity(inputs.len());
-        for ((set, &nbytes), rx) in sets.iter().zip(&token_bytes_each).zip(receivers) {
+        AsyncBatch {
+            sets,
+            receivers,
+            token_bytes: token_bytes_each,
+            submission_index,
+        }
+    }
+
+    /// Block until the given submission completes, then read each staging
+    /// buffer and release the BufferSets back to the pool. Uses
+    /// `WaitForSubmissionIndex` rather than `Wait` so the wait scope is
+    /// just this batch — later submissions in the queue keep running on
+    /// the GPU concurrently with this readback.
+    pub fn collect_async(&self, batch: AsyncBatch) -> Vec<Vec<Token>> {
+        let AsyncBatch {
+            sets,
+            receivers,
+            token_bytes,
+            submission_index,
+        } = batch;
+
+        self.ctx
+            .device
+            .poll(wgpu::Maintain::WaitForSubmissionIndex(submission_index));
+
+        let mut out = Vec::with_capacity(sets.len());
+        for ((set, &nbytes), rx) in sets.iter().zip(&token_bytes).zip(receivers) {
             rx.recv().unwrap().expect("buffer map failed");
             let view = set.staging.slice(0..nbytes).get_mapped_range();
             let tokens = unpack_tokens(bytemuck::cast_slice::<u8, u32>(&view));
@@ -595,6 +662,16 @@ impl Lz77HashPipeline {
         }
         out
     }
+}
+
+/// In-flight batch handle. Holds the GPU buffers alive until `collect_async`
+/// reads them back, plus a SubmissionIndex so the wait can be scoped to
+/// just this batch (lets the worker submit the next batch concurrently).
+pub struct AsyncBatch {
+    sets: Vec<BufferSet>,
+    receivers: Vec<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    token_bytes: Vec<u64>,
+    submission_index: wgpu::SubmissionIndex,
 }
 
 fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {

@@ -1,16 +1,16 @@
-// Phase 1 of segmented-hash LZ77.
+// Phase 1 of segmented-hash LZ77 with two candidates per (hash, segment).
 //
-// Each input position p writes (p+1) into seg_table[hash(p)][p >> seg_log2]
-// via atomicMin — keeps the OLDEST position per (hash, segment) bucket.
+// Each input position p writes (p+1) into BOTH:
+//   seg_oldest[hash(p)][p >> seg_log2]  via atomicMin  → smallest p (earliest in segment)
+//   seg_newest[hash(p)][p >> seg_log2]  via atomicMax  → largest  p (latest in segment)
 //
-// Why segmentation: a parallel hash chain on GPU loses position ordering
-// (workgroups race at the head), so chain walks cant reliably find a
-// *close* prior position. Segmenting by `p >> seg_log2` gives every
-// position p a guaranteed candidate in each prior segment within window —
-// distance bounded by (segments_walked + 1) * seg_size. That's enough for
-// match-find quality even though we get only one candidate per segment.
+// Two candidates per segment lets the lookup pick the closer one (smaller
+// distance → shorter Huffman distance code), while still having a
+// guaranteed in-segment candidate via atomicMin if the newest happens to
+// be > p (race) or filtered out by the cand<p check.
 //
-// p+1 is stored (not p) so 0 (the reset value) reads as "unused".
+// Sentinels: 0xFFFFFFFF for atomicMin (oldest), 0 for atomicMax (newest).
+// p+1 is stored so the lookup can distinguish "unused" from p=0.
 
 struct Params {
     input_len: u32,
@@ -22,9 +22,10 @@ struct Params {
     num_segs: u32,
 }
 
-@group(0) @binding(0) var<storage, read>       input_buf: array<u32>;
-@group(0) @binding(1) var<storage, read_write> seg_table: array<atomic<u32>>;
-@group(0) @binding(2) var<uniform>             params:    Params;
+@group(0) @binding(0) var<storage, read>       input_buf:  array<u32>;
+@group(0) @binding(1) var<storage, read_write> seg_oldest: array<atomic<u32>>;
+@group(0) @binding(2) var<storage, read_write> seg_newest: array<atomic<u32>>;
+@group(0) @binding(3) var<uniform>             params:     Params;
 
 fn read_byte(idx: u32) -> u32 {
     let word  = input_buf[idx / 4u];
@@ -47,6 +48,7 @@ fn build(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (p + 2u >= params.input_len) { return; }
     let h = hash3(p);
     let seg = p >> params.seg_log2;
-    // Store p+1 so the all-0xFF reset reads as "unused".
-    atomicMin(&seg_table[h * params.num_segs + seg], p + 1u);
+    let idx = h * params.num_segs + seg;
+    atomicMin(&seg_oldest[idx], p + 1u);
+    atomicMax(&seg_newest[idx], p + 1u);
 }
