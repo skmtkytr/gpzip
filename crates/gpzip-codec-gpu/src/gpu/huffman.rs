@@ -10,19 +10,19 @@
 //! the standard tree's max length is well under 15.
 
 /// Build code lengths for the given symbol frequencies, with each length
-/// capped at `max_bits`. Returns `None` if the natural Huffman tree exceeds
-/// `max_bits` and the caller should fall back to fixed Huffman.
+/// capped at `max_bits`. Returns `None` only when `max_bits` is impossibly
+/// small for the alphabet (need at least `ceil(log2(N))` bits to give every
+/// used symbol a unique code).
 ///
-/// (A correct length-limiting pass would scale or use package-merge; the
-/// previous fractional-Kraft attempt produced invalid code-length tables on
-/// inputs where the natural max length was over the limit. Erroring out is
-/// the safe choice until package-merge lands.)
+/// When the natural Huffman tree exceeds `max_bits`, the algorithm halves
+/// every frequency (rounding up to 1 for non-zero entries) and rebuilds.
+/// Eventually every frequency reaches 1 and the resulting tree is balanced
+/// at depth `ceil(log2(N))`. Slightly suboptimal vs package-merge but
+/// always produces a valid Kraft-satisfying table.
 pub fn build_code_lengths(freq: &[u32], max_bits: u32) -> Vec<u8> {
     try_build_code_lengths(freq, max_bits).unwrap_or_else(|| vec![0; freq.len()])
 }
 
-/// Same as `build_code_lengths`, but returns `None` instead of giving up
-/// silently. Use this when the caller wants to detect overflow.
 pub fn try_build_code_lengths(freq: &[u32], max_bits: u32) -> Option<Vec<u8>> {
     let n = freq.len();
     let used: Vec<usize> = (0..n).filter(|&i| freq[i] > 0).collect();
@@ -30,19 +30,33 @@ pub fn try_build_code_lengths(freq: &[u32], max_bits: u32) -> Option<Vec<u8>> {
         return Some(vec![0; n]);
     }
     if used.len() == 1 {
-        // DEFLATE requires at least one bit per used symbol so the decoder
-        // doesn't see a zero-length code.
         let mut out = vec![0u8; n];
         out[used[0]] = 1;
         return Some(out);
     }
 
-    let lens = standard_huffman(freq);
-    let max = lens.iter().max().copied().unwrap_or(0);
-    if max as u32 > max_bits {
+    // Even a balanced tree needs ceil(log2(used.len())) bits. If max_bits is
+    // tighter than that, the alphabet is too large to fit.
+    let required_bits = (used.len() as f64).log2().ceil() as u32;
+    if required_bits > max_bits {
         return None;
     }
-    Some(lens)
+
+    let mut work = freq.to_vec();
+    loop {
+        let lens = standard_huffman(&work);
+        let max = lens.iter().max().copied().unwrap_or(0) as u32;
+        if max <= max_bits {
+            return Some(lens);
+        }
+        // Halve frequencies and rebuild. Each non-zero stays >= 1 so no
+        // symbol falls out of the tree.
+        for f in &mut work {
+            if *f > 1 {
+                *f /= 2;
+            }
+        }
+    }
 }
 
 /// Standard Huffman tree → code lengths. Uses a min-heap by frequency.
