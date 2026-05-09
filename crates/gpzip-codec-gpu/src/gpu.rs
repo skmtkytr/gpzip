@@ -109,8 +109,8 @@ impl Compressor for GpuGzipCompressor {
         let chunk_fn: ChunkFn = Arc::new(move |bytes: &[u8]| -> std::io::Result<Vec<u8>> {
             // GPU: per-position LZ77 match-find.
             let raw = lz77.match_find(bytes, lz77::DEFAULT_WINDOW);
-            // CPU: greedy selection, fixed-Huffman bitstream, gzip frame.
-            let walked = lz77::greedy_walk(&raw);
+            // CPU: greedy + lazy selection, fixed-Huffman bitstream, gzip frame.
+            let walked = lz77::greedy_walk(&raw, bytes);
             let deflate = deflate::encode_block(&walked)?;
             Ok(deflate::gzip_wrap(&deflate, bytes))
         });

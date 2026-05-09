@@ -249,10 +249,16 @@ impl Lz77Pipeline {
     }
 }
 
-/// Walk the per-position output, applying a greedy match policy: at each
-/// position, take the recorded match if it's a back-reference, otherwise emit
-/// literal. Advance by `length` after a match, by 1 after a literal.
-pub fn greedy_walk(per_position: &[Token]) -> Vec<Token> {
+/// Walk the per-position output, applying a *lazy* match policy: at each
+/// position, if the next position's match is strictly longer, emit the
+/// current byte as a literal and re-evaluate from the next position. Same
+/// idea as zlib's lazy matching — a few percent ratio improvement on
+/// text-heavy input for trivial extra work.
+///
+/// Needs the input slice to recover the literal byte at positions where
+/// the shader picked a back-reference but lazy demotes to literal.
+pub fn greedy_walk(per_position: &[Token], input: &[u8]) -> Vec<Token> {
+    debug_assert_eq!(per_position.len(), input.len());
     let mut out = Vec::new();
     let mut p = 0;
     while p < per_position.len() {
@@ -260,10 +266,19 @@ pub fn greedy_walk(per_position: &[Token]) -> Vec<Token> {
         if t.is_literal() {
             out.push(t);
             p += 1;
-        } else {
-            out.push(t);
-            p += t.length as usize;
+            continue;
         }
+        // Lazy: peek at next position. If its match is strictly longer,
+        // emit the current byte as literal and let the next position win.
+        if let Some(next) = per_position.get(p + 1) {
+            if !next.is_literal() && next.length > t.length {
+                out.push(Token::literal(input[p]));
+                p += 1;
+                continue;
+            }
+        }
+        out.push(t);
+        p += t.length as usize;
     }
     out
 }
@@ -317,7 +332,7 @@ mod tests {
             assert!(t.is_literal(), "pos {i}: {:?}", t);
             assert_eq!(t.distance as u8, input[i]);
         }
-        let walked = greedy_walk(&raw);
+        let walked = greedy_walk(&raw, &input);
         let restored = reconstruct(&walked);
         assert_eq!(restored, input);
     }
@@ -339,7 +354,7 @@ mod tests {
         assert!(t.length >= 3);
         assert_eq!(t.distance, 3);
 
-        let walked = greedy_walk(&raw);
+        let walked = greedy_walk(&raw, &input);
         let restored = reconstruct(&walked);
         assert_eq!(restored, input);
     }
@@ -354,7 +369,7 @@ mod tests {
             .map(|i| ((i.wrapping_mul(2654435761)) & 0xff) as u8)
             .collect();
         let raw = pipeline.match_find(&input, 4096);
-        let walked = greedy_walk(&raw);
+        let walked = greedy_walk(&raw, &input);
         let restored = reconstruct(&walked);
         assert_eq!(restored, input);
     }
@@ -368,7 +383,7 @@ mod tests {
         // the decoder to handle self-overlap.
         let input = vec![b'a'; 64];
         let raw = pipeline.match_find(&input, 4096);
-        let walked = greedy_walk(&raw);
+        let walked = greedy_walk(&raw, &input);
         let restored = reconstruct(&walked);
         assert_eq!(restored, input);
     }

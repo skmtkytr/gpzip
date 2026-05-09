@@ -276,7 +276,7 @@ mod tests {
 
     fn round_trip(input: &[u8]) {
         let raw = cpu_lz77(input, 4096);
-        let walked = greedy_walk(&raw);
+        let walked = greedy_walk(&raw, input);
         let deflate = encode_block(&walked).expect("encode");
         let gzipped = gzip_wrap(&deflate, input);
         let mut decoded = Vec::new();
