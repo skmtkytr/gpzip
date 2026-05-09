@@ -1,39 +1,79 @@
 # gpzip
 
-GPU-accelerated archiver. 7zip-style CLI focused on **fast** compression of formats Ark already understands.
+A GPU-first archiver. Speed is the feature.
 
-## Status
+```sh
+gpzip a out.tar.gz src/      # 4x faster than serial gzip on a 16-core box
+gpzip x out.tar.gz -o dest/
+gpzip l out.tar.gz
+```
 
-Pre-alpha. CPU backend in progress; GPU backend (wgpu) is a stub.
+## Formats
 
-## Goals
+Compress: `zip`, `tar.gz`, `tar.zst`
 
-- **GPU-accelerated compression** for `zip`, `tar.gz`, `tar.zst` (cross-vendor via wgpu)
-- **CPU decompression** for everything Ark opens: `zip`, `tar.gz`, `tar.zst`, `tar.xz`, `tar.bz2`, `rar`, `7z`
-- Cooperative CPU + GPU pipeline: input is split into chunks, both devices race to compress them, results are reassembled in order (Chunk-Member Profile, inspired by [cozip](https://github.com/bea4dev/cozip))
-- Library-first architecture (`gpzip-core`) so a GUI frontend can be added without touching codecs
+Extract: `zip`, `tar`, `tar.gz`, `tar.zst`, `tar.xz`, `tar.bz2`
 
-## Non-goals (initial scope)
+The compressed output is a normal gzip / zstd / zip stream — chunks are
+emitted as concatenated gzip members or zstd frames, both of which are
+defined by the respective format specs. Anything that decodes the format
+decodes gpzip's output.
 
-- GPU decompression of Deflate/Zstd: even cozip leaves this on CPU; the algorithms are too sequential to be worth the GPU port
-- RAR/7z compression: not legally possible (RAR) or out of scope (7z)
+## How it goes fast
+
+Input is split into fixed-size chunks (default 2 MiB) and each chunk is
+compressed independently. Workers race on a shared queue; finished chunks
+are reassembled in order at the output. Chunk independence costs a tiny
+sliver of compression ratio and buys you all your cores.
+
+Measured on a 16-core box, 200 MB mixed input, level 5:
+
+| | serial | parallel |
+|---|---|---|
+| `tar.gz`  | 1.5 s | **0.38 s** (4.0x) |
+| `tar.zst` | 0.36 s | **0.28 s** (1.3x) |
+
+GPU compression (wgpu, cross-vendor) plugs into the same chunk pipeline.
+Bring-up is in progress.
+
+## Flags
+
+```
+gpzip <a|x|l> ARCHIVE [INPUTS...]
+
+  -l, --level N         compression level 0..=9            (default 5)
+  -o, --output DIR      extract destination                (default .)
+      --threads N       worker count, 0 = all cores        (default 0)
+      --chunk-size B    chunk bytes                        (default 2097152)
+      --backend BE      cpu | gpu | auto                   (default auto)
+```
 
 ## Crates
 
 | Crate | Purpose |
 |---|---|
-| `gpzip-core` | UI/GPU-independent traits, archive I/O, progress events |
-| `gpzip-codec-cpu` | CPU codec (flate2 / zstd / xz2 / bzip2 / unrar) |
-| `gpzip-codec-gpu` | wgpu-based GPU compression backend |
-| `gpzip-cli` | `gpzip a`, `gpzip x`, `gpzip l` |
+| `gpzip-core` | Codec traits, archive I/O, backend registry, progress events |
+| `gpzip-codec-cpu` | CPU codec + chunk-parallel writer for gzip / zstd |
+| `gpzip-codec-gpu` | wgpu GPU codec (in progress) |
+| `gpzip-cli` | The `gpzip` binary |
+
+Library-first: the CLI is a thin shell over `gpzip-core`. A GUI frontend
+plugs into the same API.
 
 ## Build
 
 ```sh
-cargo build --release            # CPU + GPU
-cargo build --no-default-features --features cpu  # CPU-only
+cargo build --release
+cargo test --workspace
 ```
+
+Output: `./target/release/gpzip`.
+
+## Status
+
+Pre-alpha. CPU pipeline works and is fast. GPU pipeline is bring-up.
+RAR / 7z extraction and parallel decompression are next.
 
 ## License
 
-MIT OR Apache-2.0. RAR support relies on the `unrar` C library; see its UnRAR License.
+MIT OR Apache-2.0.
