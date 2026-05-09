@@ -36,12 +36,12 @@ use wgpu::util::DeviceExt;
 use super::context::GpuContext;
 use super::lz77::Token;
 
-/// Maximum token count the pool's buffers handle in one call. Chunks
-/// larger than this would need a fresh, bigger BufferSet (we'd panic
-/// before then because n_workgroups > WG_SIZE breaks the single-pass
-/// scan_totals; see assert in dispatch_emit). 32 KiB matches
-/// `GpuBackend::chunk_size`.
-const MAX_TOKENS: usize = 32 * 1024;
+/// Maximum token count the pool's buffers handle in one call. Must
+/// match (or exceed) `GpuBackend::chunk_size` since one position can
+/// produce one walked token. With WG_SIZE=1024 the single-pass scan
+/// covers up to WG_SIZE^2 = 1M tokens, so we can scale this up if
+/// chunk_size grows further.
+const MAX_TOKENS: usize = 128 * 1024;
 /// Max output bytes for the worst case: ceil((header + N*32 + 16) / 8) + slack.
 /// Header is at most ~512 bytes for an extreme dynamic block; round generously.
 const MAX_OUTPUT_BYTES: usize = MAX_TOKENS * 4 + 1024;

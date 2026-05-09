@@ -107,6 +107,10 @@ pub struct GpuBackend {
     #[allow(dead_code)]
     lz77: Arc<lz77_hash::Lz77HashPipeline>,
     batched: Arc<batch::BatchedLz77>,
+    /// GPU dynamic-Huffman encoder (D-3). Held so the per-call BufferSet
+    /// pool persists across chunks. Set to None to fall back to the
+    /// host's `encode_block_fast` (controlled by `GPZIP_GPU_ENCODE`).
+    huffman_emit: Option<Arc<huffman_emit_v2::HuffmanEmitV2Pipeline>>,
     chunk_size: usize,
     max_in_flight: usize,
 }
@@ -126,10 +130,22 @@ impl GpuBackend {
             Arc::clone(&lz77),
             lz77_hash::DEFAULT_WINDOW,
         ));
+        // GPU encoder is opt-in for now via GPZIP_GPU_ENCODE=1. The host
+        // `encode_block_fast` is faster per single chunk on this hardware
+        // (see D-3/D-4 bench in commit history); the toggle is here so the
+        // production swap can be measured end-to-end without a code change.
+        let huffman_emit = if std::env::var_os("GPZIP_GPU_ENCODE").is_some() {
+            Some(Arc::new(huffman_emit_v2::HuffmanEmitV2Pipeline::new(
+                Arc::clone(&ctx),
+            )))
+        } else {
+            None
+        };
         Ok(Self {
             ctx,
             lz77,
             batched,
+            huffman_emit,
             // 256 KiB. Rationale: GPU dispatch overhead is roughly fixed
             // per BatchedLz77 submission (~150 µs poll + ~50 µs misc),
             // so per-byte cost scales with 1/chunk_size. The original
@@ -175,14 +191,15 @@ impl GpuBackend {
     /// matching the CPU configuration.
     pub fn gzip_chunk_fn(&self) -> ChunkFn {
         let batched = Arc::clone(&self.batched);
+        let huffman_emit = self.huffman_emit.clone();
         let sub_chunk = self.chunk_size;
         Arc::new(move |bytes: &[u8]| -> std::io::Result<Vec<u8>> {
             if bytes.len() <= sub_chunk {
-                return encode_one(&batched, bytes);
+                return encode_one(&batched, huffman_emit.as_deref(), bytes);
             }
             let mut out = Vec::with_capacity(bytes.len());
             for piece in bytes.chunks(sub_chunk) {
-                let member = encode_one(&batched, piece)?;
+                let member = encode_one(&batched, huffman_emit.as_deref(), piece)?;
                 out.extend_from_slice(&member);
             }
             Ok(out)
@@ -247,11 +264,24 @@ impl Compressor for GpuGzipCompressor {
 }
 
 /// Free function so both `gzip_chunk_fn` and `chunk_fn_for_writer` share
-/// the same one-piece encode path.
-fn encode_one(batched: &Arc<batch::BatchedLz77>, bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+/// the same one-piece encode path. When `huffman_emit` is `Some`, the
+/// dynamic-Huffman block bitstream is built on the GPU (D-3); else the
+/// host's `encode_block_fast` runs.
+fn encode_one(
+    batched: &Arc<batch::BatchedLz77>,
+    huffman_emit: Option<&huffman_emit_v2::HuffmanEmitV2Pipeline>,
+    bytes: &[u8],
+) -> std::io::Result<Vec<u8>> {
     let raw = batched.submit(bytes.to_vec());
     let walked = lz77::greedy_walk(&raw, bytes);
-    let deflate = deflate::encode_block_fast(&walked)?;
+    let deflate = match huffman_emit {
+        Some(p) => p
+            .emit_dynamic_block_v3(&walked)
+            // If the GPU dynamic build fails (Huffman tree too tall —
+            // extremely rare), fall back to the host fast encoder.
+            .or_else(|_| deflate::encode_block_fast(&walked))?,
+        None => deflate::encode_block_fast(&walked)?,
+    };
     Ok(deflate::gzip_wrap(&deflate, bytes))
 }
 
@@ -259,9 +289,14 @@ impl GpuGzipCompressor {
     fn chunk_fn_for_writer(&self) -> ChunkFn {
         let batched = Arc::clone(&self.batched);
         Arc::new(move |bytes: &[u8]| -> std::io::Result<Vec<u8>> {
-            // The pure --backend gpu path always feeds chunks of exactly
-            // self.chunk_size, so no sub-chunking needed here.
-            encode_one(&batched, bytes)
+            // GpuGzipCompressor doesn't currently carry the GPU encoder;
+            // the env-var-controlled swap is wired through
+            // `GpuBackend::gzip_chunk_fn` instead, which is what the
+            // hybrid path uses. The pure --backend gpu compressor stays
+            // on host encoder for now (where the production-swap
+            // experiment pays off the most is in the hybrid build, since
+            // it has spare CPU permits).
+            encode_one(&batched, None, bytes)
         })
     }
 }
