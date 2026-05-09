@@ -11,7 +11,14 @@ description = "wgpu-based GPU codec backend for gpzip (cross-vendor)"
 # the workspace builds on machines without a GPU runtime (CI, embedded).
 [features]
 default = []
-enabled = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "dep:crc32fast"]
+enabled = [
+    "dep:wgpu",
+    "dep:pollster",
+    "dep:bytemuck",
+    "dep:crc32fast",
+    "dep:flate2",
+    "dep:gpzip-codec-cpu",
+]
 
 [dependencies]
 gpzip-core = { path = "../gpzip-core" }
@@ -23,6 +30,8 @@ wgpu = { workspace = true, optional = true }
 pollster = { workspace = true, optional = true }
 bytemuck = { workspace = true, optional = true }
 crc32fast = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
+gpzip-codec-cpu = { path = "../gpzip-codec-cpu", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

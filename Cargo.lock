@@ -831,6 +831,8 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "crc32fast",
+ "flate2",
+ "gpzip-codec-cpu",
  "gpzip-core",
  "pollster",
  "tempfile",
