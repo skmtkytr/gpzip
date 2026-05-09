@@ -237,6 +237,11 @@ impl Lz77HashPipeline {
 
     /// Per-position LZ77. Same output shape as the brute-force pipeline.
     /// Reuses GPU buffers across calls via the internal pool.
+    ///
+    /// Today's production path goes through `match_find_batch` via the
+    /// `BatchedLz77` worker; this single-shot entry point is kept for
+    /// tests and as a fallback for callers that don't have batching set up.
+    #[allow(dead_code)]
     pub fn match_find(&self, input: &[u8], window: u32) -> Vec<Token> {
         let n = input.len() as u32;
         if n == 0 {
@@ -376,6 +381,176 @@ impl Lz77HashPipeline {
 
         self.release(set);
         tokens
+    }
+
+    /// Process several chunks in a single command-buffer submission. Acquires
+    /// one BufferSet per input, builds all the hash-reset, build, lookup, and
+    /// copy commands into one encoder, submits once, polls once, then maps
+    /// every staging buffer in turn. Cuts the per-chunk submit + poll cost
+    /// down to per-batch.
+    pub fn match_find_batch(&self, inputs: &[&[u8]], window: u32) -> Vec<Vec<Token>> {
+        if inputs.is_empty() {
+            return Vec::new();
+        }
+
+        // Acquire all buffer sets up front so the encoder can reference them.
+        let sets: Vec<BufferSet> = inputs
+            .iter()
+            .map(|i| self.acquire(i.len().max(4)))
+            .collect();
+
+        // Bind groups likewise need to be alive for the whole encoder; collect
+        // them into Vecs so they live until submit.
+        let mut build_bgs = Vec::with_capacity(inputs.len());
+        let mut lookup_bgs = Vec::with_capacity(inputs.len());
+        let mut token_bytes_each = Vec::with_capacity(inputs.len());
+
+        // Upload inputs and update params buffers.
+        for (input, set) in inputs.iter().zip(&sets) {
+            let n = input.len() as u32;
+            let padded = input.len().next_multiple_of(4);
+            let pad_extra = padded - input.len();
+            if pad_extra == 0 {
+                self.ctx.queue.write_buffer(&set.input, 0, input);
+            } else {
+                let mut buf = Vec::with_capacity(padded);
+                buf.extend_from_slice(input);
+                buf.resize(padded, 0);
+                self.ctx.queue.write_buffer(&set.input, 0, &buf);
+            }
+
+            let params = Params {
+                input_len: n,
+                hash_bits: HASH_BITS,
+                window,
+                min_match: MIN_MATCH,
+                max_match: MAX_MATCH,
+                chain_k: CHAIN_K,
+                _pad: [0; 2],
+            };
+            self.ctx
+                .queue
+                .write_buffer(&set.params, 0, bytemuck::bytes_of(&params));
+
+            build_bgs.push(
+                self.ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("gpzip-lz77-batch-build-bg"),
+                        layout: &self.build_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: set.input.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: set.hash_table.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: set.params.as_entire_binding(),
+                            },
+                        ],
+                    }),
+            );
+            lookup_bgs.push(
+                self.ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("gpzip-lz77-batch-lookup-bg"),
+                        layout: &self.lookup_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: set.input.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: set.hash_table.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: set.tokens.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: set.params.as_entire_binding(),
+                            },
+                        ],
+                    }),
+            );
+            token_bytes_each.push((n as u64) * (std::mem::size_of::<Token>() as u64));
+        }
+
+        // One encoder for all chunks.
+        let mut encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("gpzip-lz77-batch-enc"),
+            });
+        for (idx, set) in sets.iter().enumerate() {
+            let n = inputs[idx].len() as u32;
+            encoder.copy_buffer_to_buffer(
+                &self.reset_blob,
+                0,
+                &set.hash_table,
+                0,
+                (HASH_SIZE * 4) as u64,
+            );
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("gpzip-lz77-batch-build-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.build_pipeline);
+                pass.set_bind_group(0, &build_bgs[idx], &[]);
+                pass.dispatch_workgroups(n.div_ceil(64), 1, 1);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("gpzip-lz77-batch-lookup-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.lookup_pipeline);
+                pass.set_bind_group(0, &lookup_bgs[idx], &[]);
+                pass.dispatch_workgroups(n.div_ceil(64), 1, 1);
+            }
+            encoder.copy_buffer_to_buffer(&set.tokens, 0, &set.staging, 0, token_bytes_each[idx]);
+        }
+        self.ctx.queue.submit(std::iter::once(encoder.finish()));
+
+        // Map every staging buffer; a single device.poll(Wait) covers all of
+        // them because Wait blocks until *all* pending submissions complete.
+        let receivers: Vec<_> = sets
+            .iter()
+            .zip(&token_bytes_each)
+            .map(|(set, &nbytes)| {
+                let slice = set.staging.slice(0..nbytes);
+                let (tx, rx) = std::sync::mpsc::channel();
+                slice.map_async(wgpu::MapMode::Read, move |res| {
+                    let _ = tx.send(res);
+                });
+                rx
+            })
+            .collect();
+        self.ctx.device.poll(wgpu::Maintain::Wait);
+
+        let mut out = Vec::with_capacity(inputs.len());
+        for ((set, &nbytes), rx) in sets.iter().zip(&token_bytes_each).zip(receivers) {
+            rx.recv().unwrap().expect("buffer map failed");
+            let view = set.staging.slice(0..nbytes).get_mapped_range();
+            let tokens: Vec<Token> = bytemuck::cast_slice::<u8, Token>(&view).to_vec();
+            drop(view);
+            set.staging.unmap();
+            out.push(tokens);
+        }
+
+        for set in sets {
+            self.release(set);
+        }
+        out
     }
 }
 

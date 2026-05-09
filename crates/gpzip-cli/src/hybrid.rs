@@ -54,7 +54,13 @@ impl CodecBackend for HybridBackend {
                 gpu_chunk_fn: gpu.gzip_chunk_fn(),
                 chunk_size: self.cpu.chunk_size(),
                 cpu_workers: self.cpu.max_in_flight(),
-                gpu_workers: gpu.max_in_flight(),
+                // Cap hybrid GPU permits independently of the GPU backend's
+                // internal max_in_flight (which is tuned for batching when
+                // GPU is the *only* path). The GPU's compression ratio is
+                // worse than the CPU's, so letting too many chunks land on
+                // GPU bloats the output. Keep it at 2 so 80-90% of work
+                // still goes to the better-compressing CPU path.
+                gpu_workers: 2.min(gpu.max_in_flight()),
             })),
             // Zstd has no GPU implementation today; fall through to CPU.
             (Algorithm::Zstd, _) => Ok(Box::new(ZstdCompressor::new(

@@ -24,6 +24,7 @@ enabled = [
 gpzip-core = { path = "../gpzip-core" }
 thiserror.workspace = true
 tracing.workspace = true
+crossbeam-channel.workspace = true
 
 # Optional, gated behind `enabled`
 wgpu = { workspace = true, optional = true }
