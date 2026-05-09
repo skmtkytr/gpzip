@@ -17,15 +17,16 @@ mod deflate;
 mod huffman;
 mod identity;
 mod lz77;
+mod lz77_hash;
 
 pub use context::GpuContext;
 
 /// GPU codec. Holds an initialized wgpu device + queue and a precompiled
-/// LZ77 pipeline. Cheap to clone (Arc'd internally).
+/// hash-table LZ77 pipeline. Cheap to clone (Arc'd internally).
 #[derive(Clone)]
 pub struct GpuBackend {
     ctx: Arc<GpuContext>,
-    lz77: Arc<lz77::Lz77Pipeline>,
+    lz77: Arc<lz77_hash::Lz77HashPipeline>,
     chunk_size: usize,
     max_in_flight: usize,
 }
@@ -40,14 +41,13 @@ impl GpuBackend {
         let ctx = Arc::new(
             GpuContext::try_init().map_err(|e| Error::Codec(format!("wgpu init failed: {e}")))?,
         );
-        let lz77 = Arc::new(lz77::Lz77Pipeline::new(Arc::clone(&ctx)));
+        let lz77 = Arc::new(lz77_hash::Lz77HashPipeline::new(Arc::clone(&ctx)));
         Ok(Self {
             ctx,
             lz77,
-            // Smaller default than CPU because the brute-force LZ77 shader is
-            // O(window) per byte. Tuned upward once the hash-table variant
-            // (A-2d) is in.
-            chunk_size: 256 * 1024,
+            // Hash-table LZ77 is O(1) per position, so larger chunks amortize
+            // dispatch overhead well. 2 MiB matches the CPU default.
+            chunk_size: 2 * 1024 * 1024,
             // GPU work is already serialized on the device queue; running
             // many chunks concurrently from rayon would just contend. Keep
             // two in-flight to overlap GPU compute with CPU-side encoding.
@@ -95,7 +95,7 @@ impl CodecBackend for GpuBackend {
 }
 
 struct GpuGzipCompressor {
-    lz77: Arc<lz77::Lz77Pipeline>,
+    lz77: Arc<lz77_hash::Lz77HashPipeline>,
     chunk_size: usize,
     max_in_flight: usize,
 }
@@ -108,9 +108,9 @@ impl Compressor for GpuGzipCompressor {
     fn wrap_writer(self: Box<Self>, w: Box<dyn Write + Send>) -> Box<dyn Write + Send> {
         let lz77 = Arc::clone(&self.lz77);
         let chunk_fn: ChunkFn = Arc::new(move |bytes: &[u8]| -> std::io::Result<Vec<u8>> {
-            // GPU: per-position LZ77 match-find.
-            let raw = lz77.match_find(bytes, lz77::DEFAULT_WINDOW);
-            // CPU: greedy + lazy selection, fixed-Huffman bitstream, gzip frame.
+            // GPU: per-position hash-table LZ77.
+            let raw = lz77.match_find(bytes, lz77_hash::DEFAULT_WINDOW);
+            // CPU: greedy + lazy selection, dynamic Huffman, gzip frame.
             let walked = lz77::greedy_walk(&raw, bytes);
             let deflate = deflate::encode_block(&walked)?;
             Ok(deflate::gzip_wrap(&deflate, bytes))

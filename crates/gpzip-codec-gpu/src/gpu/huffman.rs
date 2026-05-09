@@ -10,29 +10,39 @@
 //! the standard tree's max length is well under 15.
 
 /// Build code lengths for the given symbol frequencies, with each length
-/// capped at `max_bits`. `freq[i]` is the frequency of symbol `i`. Returns
-/// a vector the same length as `freq` with the bit-length of each symbol's
-/// code (0 for unused symbols).
+/// capped at `max_bits`. Returns `None` if the natural Huffman tree exceeds
+/// `max_bits` and the caller should fall back to fixed Huffman.
+///
+/// (A correct length-limiting pass would scale or use package-merge; the
+/// previous fractional-Kraft attempt produced invalid code-length tables on
+/// inputs where the natural max length was over the limit. Erroring out is
+/// the safe choice until package-merge lands.)
 pub fn build_code_lengths(freq: &[u32], max_bits: u32) -> Vec<u8> {
+    try_build_code_lengths(freq, max_bits).unwrap_or_else(|| vec![0; freq.len()])
+}
+
+/// Same as `build_code_lengths`, but returns `None` instead of giving up
+/// silently. Use this when the caller wants to detect overflow.
+pub fn try_build_code_lengths(freq: &[u32], max_bits: u32) -> Option<Vec<u8>> {
     let n = freq.len();
     let used: Vec<usize> = (0..n).filter(|&i| freq[i] > 0).collect();
     if used.is_empty() {
-        return vec![0; n];
+        return Some(vec![0; n]);
     }
     if used.len() == 1 {
         // DEFLATE requires at least one bit per used symbol so the decoder
         // doesn't see a zero-length code.
         let mut out = vec![0u8; n];
         out[used[0]] = 1;
-        return out;
+        return Some(out);
     }
 
-    let mut lens = standard_huffman(freq);
+    let lens = standard_huffman(freq);
     let max = lens.iter().max().copied().unwrap_or(0);
     if max as u32 > max_bits {
-        limit_code_lengths(&mut lens, freq, max_bits);
+        return None;
     }
-    lens
+    Some(lens)
 }
 
 /// Standard Huffman tree → code lengths. Uses a min-heap by frequency.
@@ -89,55 +99,6 @@ fn walk(node: usize, depth: u32, left: &[i32], right: &[i32], n_leaves: usize, l
     }
     if r >= 0 {
         walk(r as usize, depth + 1, left, right, n_leaves, lens);
-    }
-}
-
-/// Force every code length down to `max_bits`. Standard zlib trick: walk
-/// from the bottom, count how many codes are over the limit, push them up,
-/// then "pay" for the displacement by lengthening some shorter codes.
-///
-/// Not the prettiest implementation, but produces a valid Kraft inequality
-/// and never exceeds `max_bits`.
-fn limit_code_lengths(lens: &mut [u8], freq: &[u32], max_bits: u32) {
-    let n = lens.len();
-    // Sort indices of used symbols by frequency ascending, then by length
-    // descending — least valuable first.
-    let mut idx: Vec<usize> = (0..n).filter(|&i| lens[i] > 0).collect();
-
-    // Clamp anything over the limit to the limit.
-    let mut overflow = 0i64;
-    for &i in &idx {
-        if lens[i] as u32 > max_bits {
-            // Each step of clamping reduces the Kraft sum;
-            // overflow tracks total slots reclaimed.
-            let extra = lens[i] as u32 - max_bits;
-            overflow += (1i64 << extra) - 1;
-            lens[i] = max_bits as u8;
-        }
-    }
-    // Now redistribute: every overflow unit means we need to lengthen one
-    // of the existing codes by 1 bit. Pick the shortest codes first
-    // (least cost in compressed size).
-    if overflow == 0 {
-        return;
-    }
-    idx.sort_by_key(|&i| (lens[i], freq[i]));
-    let mut i = 0;
-    while overflow > 0 && i < idx.len() {
-        let s = idx[i];
-        if (lens[s] as u32) < max_bits {
-            // Lengthening by 1 reclaims (1 << (max_bits - lens[s] - 1)) units
-            // of Kraft headroom.
-            lens[s] += 1;
-            overflow -= 1i64 << (max_bits - lens[s] as u32);
-        }
-        i += 1;
-        if i == idx.len() && overflow > 0 {
-            // Restart pass; lengthening some codes may have made others
-            // eligible again.
-            i = 0;
-            idx.sort_by_key(|&i| (lens[i], freq[i]));
-        }
     }
 }
 

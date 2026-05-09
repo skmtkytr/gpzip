@@ -10,7 +10,7 @@
 
 use std::io::{self, Write};
 
-use super::huffman::{build_code_lengths, canonical_codes};
+use super::huffman::{canonical_codes, try_build_code_lengths};
 use super::lz77::Token;
 
 /// RFC 1951 §3.2.7: order in which the meta-Huffman code lengths are written.
@@ -188,12 +188,16 @@ fn distance_code(distance: u32) -> (u32, u32, u32) {
     (code, extra, distance - base)
 }
 
-/// Encode `tokens` as a single DEFLATE block. Picks dynamic Huffman
-/// (BTYPE=10) by default; the dynamic header costs ~30-100 bytes but
-/// recovers that and more on any non-tiny input.
+/// Encode `tokens` as a single DEFLATE block. Tries dynamic Huffman
+/// (BTYPE=10) first; falls back to fixed Huffman (BTYPE=01) if the natural
+/// tree exceeds DEFLATE's 15-bit code length cap.
 pub fn encode_block(tokens: &[Token]) -> io::Result<Vec<u8>> {
     let mut bw = BitWriter::new(Vec::new());
-    encode_dynamic_block(tokens, &mut bw)?;
+    if !try_write_dynamic_block(tokens, &mut bw)? {
+        // Either tree was too tall or another constraint failed — fall back.
+        bw = BitWriter::new(Vec::new());
+        write_fixed_block(tokens, &mut bw)?;
+    }
     bw.finish()
 }
 
@@ -326,7 +330,10 @@ fn trim_to_min(lens: &[u8], min: usize) -> usize {
     n
 }
 
-fn write_dynamic_block<W: Write>(tokens: &[Token], bw: &mut BitWriter<W>) -> io::Result<()> {
+/// Try to write a dynamic-Huffman block. Returns `Ok(true)` on success;
+/// `Ok(false)` if the natural Huffman tree exceeds DEFLATE's 15-bit limit
+/// and the caller should fall back to the fixed-Huffman block.
+fn try_write_dynamic_block<W: Write>(tokens: &[Token], bw: &mut BitWriter<W>) -> io::Result<bool> {
     // 1. Frequencies. Always count EOB at least once.
     let mut litlen_freq = [0u32; 286];
     let mut dist_freq = [0u32; 30];
@@ -342,9 +349,14 @@ fn write_dynamic_block<W: Write>(tokens: &[Token], bw: &mut BitWriter<W>) -> io:
     }
     litlen_freq[256] += 1; // EOB
 
-    // 2. Length-limited Huffman (15 bits both alphabets).
-    let mut litlen_lens = build_code_lengths(&litlen_freq, 15);
-    let mut dist_lens = build_code_lengths(&dist_freq, 15);
+    // 2. Length-limited Huffman (15 bits both alphabets). Fall back to fixed
+    // if the natural tree is taller than DEFLATE allows.
+    let Some(mut litlen_lens) = try_build_code_lengths(&litlen_freq, 15) else {
+        return Ok(false);
+    };
+    let Some(mut dist_lens) = try_build_code_lengths(&dist_freq, 15) else {
+        return Ok(false);
+    };
 
     // DEFLATE quirk: if there's only one (or zero) distance code, you must
     // still emit at least one with length=1 and pad the table to two
@@ -387,7 +399,9 @@ fn write_dynamic_block<W: Write>(tokens: &[Token], bw: &mut BitWriter<W>) -> io:
     for e in &rle {
         meta_freq[e.code as usize] += 1;
     }
-    let meta_lens = build_code_lengths(&meta_freq, 7);
+    let Some(meta_lens) = try_build_code_lengths(&meta_freq, 7) else {
+        return Ok(false);
+    };
     let meta_codes = canonical_codes(&meta_lens);
 
     // 6. Determine HCLEN — number of meta-Huffman code lengths to write,
@@ -444,11 +458,7 @@ fn write_dynamic_block<W: Write>(tokens: &[Token], bw: &mut BitWriter<W>) -> io:
 
     // 11. End-of-block.
     bw.write_huffman(litlen_codes[256], litlen_lens[256] as u32)?;
-    Ok(())
-}
-
-fn encode_dynamic_block<W: Write>(tokens: &[Token], bw: &mut BitWriter<W>) -> io::Result<()> {
-    write_dynamic_block(tokens, bw)
+    Ok(true)
 }
 
 /// Wrap a raw DEFLATE bitstream as a gzip member (RFC 1952).
