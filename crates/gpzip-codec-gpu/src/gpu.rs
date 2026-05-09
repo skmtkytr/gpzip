@@ -45,9 +45,11 @@ impl GpuBackend {
         Ok(Self {
             ctx,
             lz77,
-            // Hash-table LZ77 is O(1) per position, so larger chunks amortize
-            // dispatch overhead well. 2 MiB matches the CPU default.
-            chunk_size: 2 * 1024 * 1024,
+            // 512 KiB strikes a balance: small enough that the oldest-wins
+            // hash table doesn't reference truly ancient positions (which
+            // hurts compression ratio on repetitive data), large enough that
+            // GPU dispatch overhead stays below 50% of total wall time.
+            chunk_size: 512 * 1024,
             // GPU work is already serialized on the device queue; running
             // many chunks concurrently from rayon would just contend. Keep
             // two in-flight to overlap GPU compute with CPU-side encoding.

@@ -24,9 +24,17 @@ use super::lz77::Token;
 const BUILD_SHADER: &str = include_str!("lz77_hash_build.wgsl");
 const LOOKUP_SHADER: &str = include_str!("lz77_hash_lookup.wgsl");
 
-/// 2^HASH_BITS slots. 16 → 64K slots, ~256 KiB per chunk hash table.
+/// 2^HASH_BITS buckets. 16 → 64K buckets.
 pub const HASH_BITS: u32 = 16;
-const HASH_SIZE: usize = 1 << HASH_BITS;
+const HASH_BUCKETS: usize = 1 << HASH_BITS;
+
+/// K sub-slots per bucket. Each input position p writes to sub-slot
+/// `p % CHAIN_K`, so positions sharing a hash spread across sub-slots and
+/// only collide when both hash AND `p % K` match. Lookup reads all K
+/// sub-slots and picks the closest prior position. K=4 keeps the table at
+/// 1 MiB and gives a decent shot at finding a recent match.
+pub const CHAIN_K: u32 = 4;
+const HASH_SIZE: usize = HASH_BUCKETS * CHAIN_K as usize;
 
 pub const MIN_MATCH: u32 = 3;
 pub const MAX_MATCH: u32 = 258;
@@ -40,7 +48,8 @@ struct Params {
     window: u32,
     min_match: u32,
     max_match: u32,
-    _pad: [u32; 3],
+    chain_k: u32,
+    _pad: [u32; 2],
 }
 
 pub struct Lz77HashPipeline {
@@ -184,7 +193,8 @@ impl Lz77HashPipeline {
             window,
             min_match: MIN_MATCH,
             max_match: MAX_MATCH,
-            _pad: [0; 3],
+            chain_k: CHAIN_K,
+            _pad: [0; 2],
         };
         let params_buffer = self
             .ctx

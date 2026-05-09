@@ -1,8 +1,8 @@
 // Phase 2 of hash-table LZ77.
 //
-// For each position p, look up the hash table entry, verify the 3-byte
-// hash hit isn't a collision, then extend the match forward. Output one
-// Token per input byte (literal or back-reference).
+// For each position p, walk all K sub-slots in its hash bucket and pick the
+// one with the largest position < p (closest prior). Verify the 3-byte hit
+// isn't a hash collision, then extend the match forward.
 
 struct Params {
     input_len: u32,
@@ -10,6 +10,7 @@ struct Params {
     window: u32,
     min_match: u32,
     max_match: u32,
+    chain_k: u32,
 }
 
 @group(0) @binding(0) var<storage, read>       input_buf:  array<u32>;
@@ -37,27 +38,33 @@ fn lookup(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = gid.x;
     if (p >= params.input_len) { return; }
 
-    // Tail of input: not enough bytes for a 3-byte hash → emit literal.
     if (p + 2u >= params.input_len) {
         tokens[p] = vec2<u32>(0u, read_byte(p));
         return;
     }
 
     let h = hash3(p);
-    let raw = hash_table[h];
-    // 0xFFFFFFFFu is the unused sentinel; raw - 1 underflows there too,
-    // so check before subtracting.
-    if (raw == 0xFFFFFFFFu) {
-        tokens[p] = vec2<u32>(0u, read_byte(p));
-        return;
+    // Walk K sub-slots, pick closest valid prior position.
+    var best_prev: u32 = 0xFFFFFFFFu;
+    for (var k: u32 = 0u; k < params.chain_k; k = k + 1u) {
+        let raw = hash_table[h * params.chain_k + k];
+        if (raw == 0xFFFFFFFFu) { continue; }
+        let cand = raw - 1u;
+        if (cand >= p) { continue; }
+        if (p - cand > params.window) { continue; }
+        // We want the largest cand (closest to p but < p).
+        if (best_prev == 0xFFFFFFFFu || cand > best_prev) {
+            best_prev = cand;
+        }
     }
-    let prev = raw - 1u;
-    if (prev >= p || p - prev > params.window) {
+
+    if (best_prev == 0xFFFFFFFFu) {
         tokens[p] = vec2<u32>(0u, read_byte(p));
         return;
     }
 
-    // Hash collision check: confirm the 3-byte prefix actually matches.
+    let prev = best_prev;
+    // Hash collision check.
     if (read_byte(prev) != read_byte(p)) {
         tokens[p] = vec2<u32>(0u, read_byte(p));
         return;
@@ -71,7 +78,6 @@ fn lookup(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    // Extend forward.
     var len: u32 = 3u;
     loop {
         if (len >= params.max_match) { break; }

@@ -1,12 +1,13 @@
 // Phase 1 of hash-table LZ77.
 //
-// Each thread takes one input position p and writes p+1 into the slot for
-// its 3-byte hash. atomicMin keeps the *oldest* position seen — that gives
-// every later position a usable back-reference target, at the cost of
-// always referring to whatever ancient position came first. Hash chains
-// would get tighter matches, but they need locking we don't want here.
+// Each thread writes its position into one of K sub-slots in its 3-byte
+// hash bucket. The sub-slot is selected by `p % K`, so positions sharing a
+// hash bucket spread across all K sub-slots and only collide when their
+// hashes match AND their `p % K` values match. atomicMin per sub-slot
+// keeps the oldest writer in each — gives the host K candidate prior
+// positions to choose from in lookup.
 //
-// p+1 is stored (not p) so the all-ones initial value behaves as "unused".
+// p+1 is stored (not p) so the all-ones initial value reads as "unused".
 
 struct Params {
     input_len: u32,
@@ -14,6 +15,7 @@ struct Params {
     window: u32,
     min_match: u32,
     max_match: u32,
+    chain_k: u32,
 }
 
 @group(0) @binding(0) var<storage, read>       input_buf:  array<u32>;
@@ -31,7 +33,6 @@ fn hash3(p: u32) -> u32 {
     let b = read_byte(p + 1u);
     let c = read_byte(p + 2u);
     let x = (a << 16u) | (b << 8u) | c;
-    // Knuth's multiplicative hash; the shift keeps only `hash_bits` bits.
     let h = x * 0x9E3779B1u;
     return h >> (32u - params.hash_bits);
 }
@@ -41,5 +42,6 @@ fn build(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = gid.x;
     if (p + 2u >= params.input_len) { return; }
     let h = hash3(p);
-    atomicMin(&hash_table[h], p + 1u);
+    let sub = p % params.chain_k;
+    atomicMin(&hash_table[h * params.chain_k + sub], p + 1u);
 }
