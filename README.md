@@ -12,7 +12,7 @@ gpzip l out.tar.gz
 
 Compress: `zip`, `tar.gz`, `tar.zst`
 
-Extract: `zip`, `tar`, `tar.gz`, `tar.zst`, `tar.xz`, `tar.bz2`
+Extract: `zip`, `tar`, `tar.gz`, `tar.zst`, `tar.xz`, `tar.bz2`, `rar`, `7z`
 
 The compressed output is a normal gzip / zstd / zip stream — chunks are
 emitted as concatenated gzip members or zstd frames, both of which are
@@ -33,8 +33,19 @@ Measured on a 16-core box, 200 MB mixed input, level 5:
 | `tar.gz`  | 1.5 s | **0.38 s** (4.0x) |
 | `tar.zst` | 0.36 s | **0.28 s** (1.3x) |
 
-GPU compression (wgpu, cross-vendor) plugs into the same chunk pipeline.
-Bring-up is in progress.
+## GPU pipeline
+
+`--backend gpu` runs LZ77 match-finding on the GPU via wgpu (Vulkan / Metal
+/ DX12 — cross-vendor). The host then encodes the GPU-emitted token stream
+into a fixed-Huffman DEFLATE block (RFC 1951 §3.2.6) and frames it as a
+standard gzip member (RFC 1952). Output is normal gzip; `gzip -t` and
+`tar tzf` accept it.
+
+The shader is brute-force today (O(window) per byte, 4 KiB window), so the
+GPU path is functional but slower than the CPU path on every input we've
+benchmarked. The point is the integration: a hash-table LZ77 shader and a
+GPU-side Huffman pass plug into the same pipeline without disturbing the
+gzip output contract.
 
 ## Flags
 
@@ -71,8 +82,9 @@ Output: `./target/release/gpzip`.
 
 ## Status
 
-Pre-alpha. CPU pipeline works and is fast. GPU pipeline is bring-up.
-RAR / 7z extraction and parallel decompression are next.
+Pre-alpha. CPU pipeline works and is fast. GPU pipeline produces valid
+gzip but is slow until the brute-force LZ77 shader gets replaced with a
+hash-table variant.
 
 ## License
 
