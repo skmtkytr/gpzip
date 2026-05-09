@@ -10,7 +10,13 @@
 
 use std::io::{self, Write};
 
+use super::huffman::{build_code_lengths, canonical_codes};
 use super::lz77::Token;
+
+/// RFC 1951 §3.2.7: order in which the meta-Huffman code lengths are written.
+const META_ORDER: [usize; 19] = [
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+];
 
 /// Bit writer that packs bits LSB-first within each byte (DEFLATE convention).
 struct BitWriter<W: Write> {
@@ -182,14 +188,28 @@ fn distance_code(distance: u32) -> (u32, u32, u32) {
     (code, extra, distance - base)
 }
 
-/// Encode `tokens` as a single DEFLATE block (BFINAL=1, BTYPE=01). Returns
-/// the raw deflate bitstream.
+/// Encode `tokens` as a single DEFLATE block. Picks dynamic Huffman
+/// (BTYPE=10) by default; the dynamic header costs ~30-100 bytes but
+/// recovers that and more on any non-tiny input.
 pub fn encode_block(tokens: &[Token]) -> io::Result<Vec<u8>> {
     let mut bw = BitWriter::new(Vec::new());
-    // Block header: BFINAL=1, BTYPE=01 (fixed). LSB-first within the byte
-    // means the encoded order is 1, 1, 0 → bits 0b011 written low to high.
-    bw.write_bits(0b011, 3)?;
+    encode_dynamic_block(tokens, &mut bw)?;
+    bw.finish()
+}
 
+/// Encode `tokens` as a single DEFLATE block using fixed Huffman (BTYPE=01).
+/// Kept for tests and as a fallback for tiny inputs where the dynamic header
+/// outweighs its savings.
+#[allow(dead_code)]
+pub fn encode_fixed_block(tokens: &[Token]) -> io::Result<Vec<u8>> {
+    let mut bw = BitWriter::new(Vec::new());
+    write_fixed_block(tokens, &mut bw)?;
+    bw.finish()
+}
+
+fn write_fixed_block<W: Write>(tokens: &[Token], bw: &mut BitWriter<W>) -> io::Result<()> {
+    // BFINAL=1, BTYPE=01 → 0b011 LSB-first.
+    bw.write_bits(0b011, 3)?;
     for tok in tokens {
         if tok.is_literal() {
             let (code, bits) = fixed_litlen_code(tok.distance);
@@ -209,12 +229,226 @@ pub fn encode_block(tokens: &[Token]) -> io::Result<Vec<u8>> {
             }
         }
     }
-
-    // End-of-block (symbol 256).
     let (eob, eob_bits) = fixed_litlen_code(256);
     bw.write_huffman(eob, eob_bits)?;
+    Ok(())
+}
 
-    bw.finish()
+/// Single RLE entry for the code-length sequence (RFC 1951 §3.2.7).
+struct RleEntry {
+    code: u8,
+    extra_bits: u32,
+    extra_value: u32,
+}
+
+/// RLE-encode a sequence of code lengths using the meta-alphabet symbols
+/// 0..18 (RFC 1951 §3.2.7).
+fn rle_encode_lengths(lens: &[u8]) -> Vec<RleEntry> {
+    let mut out = Vec::with_capacity(lens.len());
+    let mut i = 0;
+    while i < lens.len() {
+        let cur = lens[i];
+        // Run length: how many consecutive entries equal cur.
+        let mut run = 1usize;
+        while i + run < lens.len() && lens[i + run] == cur {
+            run += 1;
+        }
+        if cur == 0 {
+            // Use 18 (11..138 zeros), then 17 (3..10 zeros), then literal 0.
+            while run >= 11 {
+                let n = run.min(138);
+                out.push(RleEntry {
+                    code: 18,
+                    extra_bits: 7,
+                    extra_value: (n - 11) as u32,
+                });
+                run -= n;
+                i += n;
+            }
+            while run >= 3 {
+                let n = run.min(10);
+                out.push(RleEntry {
+                    code: 17,
+                    extra_bits: 3,
+                    extra_value: (n - 3) as u32,
+                });
+                run -= n;
+                i += n;
+            }
+            while run > 0 {
+                out.push(RleEntry {
+                    code: 0,
+                    extra_bits: 0,
+                    extra_value: 0,
+                });
+                run -= 1;
+                i += 1;
+            }
+        } else {
+            // Emit the value once literally, then 16 (3..6 repeats of prev).
+            out.push(RleEntry {
+                code: cur,
+                extra_bits: 0,
+                extra_value: 0,
+            });
+            i += 1;
+            run -= 1;
+            while run >= 3 {
+                let n = run.min(6);
+                out.push(RleEntry {
+                    code: 16,
+                    extra_bits: 2,
+                    extra_value: (n - 3) as u32,
+                });
+                run -= n;
+                i += n;
+            }
+            while run > 0 {
+                out.push(RleEntry {
+                    code: cur,
+                    extra_bits: 0,
+                    extra_value: 0,
+                });
+                run -= 1;
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Trim trailing zeros from a code-length array, but keep at least `min` entries.
+fn trim_to_min(lens: &[u8], min: usize) -> usize {
+    let mut n = lens.len();
+    while n > min && lens[n - 1] == 0 {
+        n -= 1;
+    }
+    n
+}
+
+fn write_dynamic_block<W: Write>(tokens: &[Token], bw: &mut BitWriter<W>) -> io::Result<()> {
+    // 1. Frequencies. Always count EOB at least once.
+    let mut litlen_freq = [0u32; 286];
+    let mut dist_freq = [0u32; 30];
+    for tok in tokens {
+        if tok.is_literal() {
+            litlen_freq[tok.distance as usize] += 1;
+        } else {
+            let (lcode, _, _) = length_code(tok.length);
+            litlen_freq[lcode as usize] += 1;
+            let (dcode, _, _) = distance_code(tok.distance);
+            dist_freq[dcode as usize] += 1;
+        }
+    }
+    litlen_freq[256] += 1; // EOB
+
+    // 2. Length-limited Huffman (15 bits both alphabets).
+    let mut litlen_lens = build_code_lengths(&litlen_freq, 15);
+    let mut dist_lens = build_code_lengths(&dist_freq, 15);
+
+    // DEFLATE quirk: if there's only one (or zero) distance code, you must
+    // still emit at least one with length=1 and pad the table to two
+    // entries — the decoder needs a non-empty distance Huffman tree.
+    let used_dist: usize = dist_lens.iter().filter(|&&l| l > 0).count();
+    if used_dist == 0 {
+        dist_lens[0] = 1;
+        dist_lens[1] = 1;
+    } else if used_dist == 1 {
+        // Find the used one; if it's index 0, also set index 1; else set index 0.
+        let only = dist_lens.iter().position(|&l| l > 0).unwrap();
+        dist_lens[only] = 1;
+        dist_lens[1 - only.min(1)] = 1;
+    }
+
+    // Same edge for litlen (extremely unlikely — EOB is always present).
+    if litlen_lens.iter().filter(|&&l| l > 0).count() < 2 {
+        // Force code 0 and EOB to length 1 each.
+        litlen_lens[0] = 1;
+        litlen_lens[256] = 1;
+    }
+
+    let litlen_codes = canonical_codes(&litlen_lens);
+    let dist_codes = canonical_codes(&dist_lens);
+
+    // 3. Determine HLIT, HDIST.
+    let nlit = trim_to_min(&litlen_lens, 257);
+    let ndist = trim_to_min(&dist_lens, 1);
+    let hlit = (nlit - 257) as u32;
+    let hdist = (ndist - 1) as u32;
+
+    // 4. RLE-encode the combined length sequence.
+    let mut combined = Vec::with_capacity(nlit + ndist);
+    combined.extend_from_slice(&litlen_lens[..nlit]);
+    combined.extend_from_slice(&dist_lens[..ndist]);
+    let rle = rle_encode_lengths(&combined);
+
+    // 5. Meta-Huffman from RLE symbol frequencies.
+    let mut meta_freq = [0u32; 19];
+    for e in &rle {
+        meta_freq[e.code as usize] += 1;
+    }
+    let meta_lens = build_code_lengths(&meta_freq, 7);
+    let meta_codes = canonical_codes(&meta_lens);
+
+    // 6. Determine HCLEN — number of meta-Huffman code lengths to write,
+    // in the special order. Trim trailing zeros but keep at least 4.
+    let mut hclen_count = 19;
+    while hclen_count > 4 && meta_lens[META_ORDER[hclen_count - 1]] == 0 {
+        hclen_count -= 1;
+    }
+    let hclen = (hclen_count - 4) as u32;
+
+    // 7. Write block header.
+    // BFINAL=1, BTYPE=10 → bits 1, 0, 1 written LSB-first → value 0b101.
+    bw.write_bits(0b101, 3)?;
+    bw.write_bits(hlit, 5)?;
+    bw.write_bits(hdist, 5)?;
+    bw.write_bits(hclen, 4)?;
+
+    // 8. Meta-Huffman code lengths (3 bits each, in special order).
+    for i in 0..hclen_count {
+        bw.write_bits(meta_lens[META_ORDER[i]] as u32, 3)?;
+    }
+
+    // 9. Encoded code lengths (RLE through meta-Huffman).
+    for e in &rle {
+        let code = meta_codes[e.code as usize];
+        let bits = meta_lens[e.code as usize] as u32;
+        bw.write_huffman(code, bits)?;
+        if e.extra_bits > 0 {
+            bw.write_bits(e.extra_value, e.extra_bits)?;
+        }
+    }
+
+    // 10. Emit tokens with dynamic codes.
+    for tok in tokens {
+        if tok.is_literal() {
+            let sym = tok.distance as usize;
+            bw.write_huffman(litlen_codes[sym], litlen_lens[sym] as u32)?;
+        } else {
+            let (lcode, lex_bits, lex_val) = length_code(tok.length);
+            bw.write_huffman(
+                litlen_codes[lcode as usize],
+                litlen_lens[lcode as usize] as u32,
+            )?;
+            if lex_bits > 0 {
+                bw.write_bits(lex_val, lex_bits)?;
+            }
+            let (dcode, dex_bits, dex_val) = distance_code(tok.distance);
+            bw.write_huffman(dist_codes[dcode as usize], dist_lens[dcode as usize] as u32)?;
+            if dex_bits > 0 {
+                bw.write_bits(dex_val, dex_bits)?;
+            }
+        }
+    }
+
+    // 11. End-of-block.
+    bw.write_huffman(litlen_codes[256], litlen_lens[256] as u32)?;
+    Ok(())
+}
+
+fn encode_dynamic_block<W: Write>(tokens: &[Token], bw: &mut BitWriter<W>) -> io::Result<()> {
+    write_dynamic_block(tokens, bw)
 }
 
 /// Wrap a raw DEFLATE bitstream as a gzip member (RFC 1952).

@@ -14,6 +14,7 @@ use gpzip_core::{
 mod chunk;
 mod context;
 mod deflate;
+mod huffman;
 mod identity;
 mod lz77;
 
